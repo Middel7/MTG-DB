@@ -1,0 +1,31 @@
+[project]
+name = "mtgdb"
+version = "0.1.0"
+description = "Base de données MTG partagée — modèles SQLAlchemy, migrations Alembic, scripts d'import Scryfall"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg2-binary>=2.9",
+    "python-dotenv>=1.0",
+    # Scripts d'import
+    "httpx>=0.27",
+    "ijson>=3.3",
+    "tqdm>=4.66",
+]
+
+[project.scripts]
+mtgdb-import = "mtgdb.scripts.import_scryfall:main"
+mtgdb-game-changers = "mtgdb.scripts.import_game_changers:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtgdb"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]

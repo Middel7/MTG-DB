@@ -1,0 +1,8 @@
+Migrations Alembic pour la base MTG-DB.
+
+Chaîne actuelle :
+  392e971f7759  → init (tables cards, card_faces, card_printings, card_prices, mtg_sets, import_runs)
+  a1b2c3d4e5f6  → ajout colonne game_changer sur cards
+
+Pour appliquer toutes les migrations :
+  alembic upgrade head
