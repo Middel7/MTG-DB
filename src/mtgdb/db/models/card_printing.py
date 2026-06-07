@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import date
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import Boolean, Date, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from mtgdb.db.base import Base
@@ -50,6 +50,7 @@ class CardPrinting(Base):
     image_normal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_large: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     scryfall_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
 
     card: Mapped["Card"] = relationship("Card", back_populates="printings")
     mtg_set: Mapped[Optional["MtgSet"]] = relationship("MtgSet", back_populates="printings")

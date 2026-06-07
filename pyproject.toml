@@ -17,6 +17,10 @@ dependencies = [
 [project.scripts]
 mtgdb-import = "mtgdb.scripts.import_scryfall:main"
 mtgdb-game-changers = "mtgdb.scripts.import_game_changers:main"
+mtgdb-cm-products = "scripts.import_cardmarket_products:main"
+mtgdb-cm-prices = "scripts.import_cardmarket_price_guide:main"
+mtgdb-cm-link = "scripts.link_cardmarket_to_scryfall:main"
+mtgdb-cm-all = "scripts.import_cardmarket_all:main"
 
 [build-system]
 requires = ["hatchling"]

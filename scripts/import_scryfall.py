@@ -21,6 +21,7 @@ import argparse
 import logging
 import sys
 from datetime import date, datetime, timezone
+
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +225,7 @@ def _parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
         "image_normal": img.get("normal"),
         "image_large": img.get("large"),
         "scryfall_uri": raw.get("scryfall_uri"),
+        "cardmarket_id": raw.get("cardmarket_id"),
     }
 
 
@@ -300,6 +302,7 @@ def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
         "rarity", "released_at", "artist", "border_color", "frame",
         "full_art", "promo", "reprint", "digital",
         "image_small", "image_normal", "image_large", "scryfall_uri",
+        "cardmarket_id",
     ]
     stmt = pg_insert(CardPrinting).values(rows)
     stmt = stmt.on_conflict_do_update(
