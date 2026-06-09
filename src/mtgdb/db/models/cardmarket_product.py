@@ -12,7 +12,6 @@ from mtgdb.db.base import Base
 
 if TYPE_CHECKING:
     from mtgdb.db.models.cardmarket_price_guide_entry import CardmarketPriceGuideEntry
-    from mtgdb.db.models.cardmarket_product_localization import CardmarketProductLocalization
 
 
 class CardmarketProduct(Base):
@@ -50,9 +49,6 @@ class CardmarketProduct(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
-    localizations: Mapped[List["CardmarketProductLocalization"]] = relationship(
-        "CardmarketProductLocalization", back_populates="product", cascade="all, delete-orphan"
-    )
     price_guide_entries: Mapped[List["CardmarketPriceGuideEntry"]] = relationship(
         "CardmarketPriceGuideEntry", back_populates="product"
     )

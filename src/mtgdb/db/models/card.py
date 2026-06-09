@@ -35,7 +35,7 @@ def normalize_card_name(name: str) -> str:
 
 
 class Card(Base):
-    __tablename__ = "cards"
+    __tablename__ = "scryfall_cards"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     oracle_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False, index=True)
@@ -73,6 +73,5 @@ class Card(Base):
     printings: Mapped[List["CardPrinting"]] = relationship(
         "CardPrinting", back_populates="card", lazy="select"
     )
-
     def __repr__(self) -> str:
         return f"<Card oracle_id={self.oracle_id!r} name={self.name!r}>"

@@ -5,7 +5,6 @@ from mtgdb.db.models.card_printing import CardPrinting
 from mtgdb.db.models.cardmarket_import_file import CardmarketImportFile
 from mtgdb.db.models.cardmarket_price_guide_entry import CardmarketPriceGuideEntry
 from mtgdb.db.models.cardmarket_product import CardmarketProduct
-from mtgdb.db.models.cardmarket_product_localization import CardmarketProductLocalization
 from mtgdb.db.models.import_run import ImportRun
 from mtgdb.db.models.mtg_set import MtgSet
 
@@ -17,7 +16,6 @@ __all__ = [
     "CardmarketImportFile",
     "CardmarketPriceGuideEntry",
     "CardmarketProduct",
-    "CardmarketProductLocalization",
     "ImportRun",
     "MtgSet",
 ]

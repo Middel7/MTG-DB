@@ -17,11 +17,11 @@ if TYPE_CHECKING:
 
 
 class CardFace(Base):
-    __tablename__ = "card_faces"
+    __tablename__ = "scryfall_card_faces"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     card_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("cards.id", ondelete="CASCADE"), nullable=False, index=True
+        Integer, ForeignKey("scryfall_cards.id", ondelete="CASCADE"), nullable=False, index=True
     )
     face_name: Mapped[str] = mapped_column(String(255), nullable=False)
     mana_cost: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)

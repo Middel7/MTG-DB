@@ -67,7 +67,7 @@ def fetch_bulk_metadata(client: httpx.Client) -> tuple[str, str, datetime]:
     resp = client.get(BULK_DATA_URL)
     resp.raise_for_status()
     for item in resp.json().get("data", []):
-        if item.get("type") == "default_cards":
+        if item.get("type") == "all_cards":
             updated_at = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00"))
             uri: str = item["download_uri"]
             filename = uri.rsplit("/", 1)[-1]
@@ -193,6 +193,16 @@ def _parse_face_rows(raw: dict[str, Any], card_id: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _extract_printed_name(raw: dict[str, Any]) -> str | None:
+    printed = raw.get("printed_name")
+    if not printed:
+        faces = raw.get("card_faces") or []
+        face_names = [f.get("printed_name") for f in faces if f.get("printed_name")]
+        if face_names:
+            printed = " // ".join(face_names)
+    return printed or None
+
+
 def _parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
     img = raw.get("image_uris") or {}
     if not img:
@@ -226,7 +236,9 @@ def _parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
         "image_large": img.get("large"),
         "scryfall_uri": raw.get("scryfall_uri"),
         "cardmarket_id": raw.get("cardmarket_id"),
+        "printed_name": _extract_printed_name(raw),
     }
+
 
 
 def _parse_price_rows(prices: dict[str, Any], printing_id: int, today: date) -> list[dict[str, Any]]:
@@ -302,7 +314,7 @@ def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
         "rarity", "released_at", "artist", "border_color", "frame",
         "full_art", "promo", "reprint", "digital",
         "image_small", "image_normal", "image_large", "scryfall_uri",
-        "cardmarket_id",
+        "cardmarket_id", "printed_name",
     ]
     stmt = pg_insert(CardPrinting).values(rows)
     stmt = stmt.on_conflict_do_update(
@@ -324,6 +336,27 @@ def _insert_prices(session: Session, rows: list[dict]) -> None:
     stmt = pg_insert(CardPrice).values(rows)
     stmt = stmt.on_conflict_do_nothing()
     session.execute(stmt)
+
+
+def propagate_cardmarket_ids(session: Session) -> int:
+    """
+    Propage cardmarket_id aux impressions qui n'en ont pas,
+    en copiant depuis une autre impression de la même carte dans la même édition
+    (même card_id + set_code + collector_number).
+    """
+    from sqlalchemy import text as sa_text
+    result = session.execute(sa_text("""
+        UPDATE scryfall_card_printings AS target
+        SET cardmarket_id = source.cardmarket_id
+        FROM scryfall_card_printings AS source
+        WHERE target.cardmarket_id IS NULL
+          AND source.cardmarket_id IS NOT NULL
+          AND target.card_id = source.card_id
+          AND target.set_code = source.set_code
+          AND target.collector_number = source.collector_number
+    """))
+    session.commit()
+    return result.rowcount
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -513,6 +546,10 @@ def main() -> None:
                 log.info("Import des cartes (streaming, batches de 500)...")
                 cards_n, printings_n, errors_n = import_cards(dest, session)
 
+                log.info("Propagation des cardmarket_id aux impressions non-anglaises...")
+                propagated = propagate_cardmarket_ids(session)
+                log.info(f"  {propagated:,} impression(s) mise(s) à jour.")
+
                 elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
                 run.status = "success"
                 run.finished_at = datetime.now(timezone.utc)
@@ -523,11 +560,12 @@ def main() -> None:
 
                 log.info("")
                 log.info("=" * 47)
-                log.info(f"  Cartes     : {cards_n:>10,}")
-                log.info(f"  Impressions: {printings_n:>10,}")
-                log.info(f"  Éditions   : {n_sets:>10,}")
-                log.info(f"  Erreurs    : {errors_n:>10}")
-                log.info(f"  Durée      : {elapsed:>9}s")
+                log.info(f"  Cartes          : {cards_n:>10,}")
+                log.info(f"  Impressions     : {printings_n:>10,}")
+                log.info(f"  CM id propagés  : {propagated:>10,}")
+                log.info(f"  Éditions        : {n_sets:>10,}")
+                log.info(f"  Erreurs         : {errors_n:>10}")
+                log.info(f"  Durée           : {elapsed:>9}s")
                 log.info("=" * 47)
 
             except Exception as exc:

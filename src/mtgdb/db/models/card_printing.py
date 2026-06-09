@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 class CardPrinting(Base):
-    __tablename__ = "card_printings"
+    __tablename__ = "scryfall_card_printings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     scryfall_id: Mapped[str] = mapped_column(
@@ -27,11 +27,11 @@ class CardPrinting(Base):
     )
     oracle_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     card_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("cards.id", ondelete="CASCADE"), nullable=False, index=True
+        Integer, ForeignKey("scryfall_cards.id", ondelete="CASCADE"), nullable=False, index=True
     )
     set_code: Mapped[Optional[str]] = mapped_column(
         String(16),
-        ForeignKey("mtg_sets.code", ondelete="SET NULL"),
+        ForeignKey("scryfall_mtg_sets.code", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
@@ -51,6 +51,7 @@ class CardPrinting(Base):
     image_large: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     scryfall_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    printed_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
 
     card: Mapped["Card"] = relationship("Card", back_populates="printings")
     mtg_set: Mapped[Optional["MtgSet"]] = relationship("MtgSet", back_populates="printings")

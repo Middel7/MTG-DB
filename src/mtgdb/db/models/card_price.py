@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 class CardPrice(Base):
-    __tablename__ = "card_prices"
+    __tablename__ = "scryfall_card_prices"
 
     __table_args__ = (
         UniqueConstraint(
@@ -30,7 +30,7 @@ class CardPrice(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     printing_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("card_printings.id", ondelete="CASCADE"),
+        ForeignKey("scryfall_card_printings.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )

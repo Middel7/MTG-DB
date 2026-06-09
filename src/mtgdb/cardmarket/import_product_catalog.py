@@ -1,6 +1,6 @@
 """
 Import du Product Catalog Cardmarket (Magic Singles).
-Upsert dans cardmarket_products + cardmarket_product_localizations.
+Upsert dans cardmarket_products.
 """
 from __future__ import annotations
 
@@ -13,10 +13,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
-from mtgdb.cardmarket.parsers import extract_products_list, parse_localizations, parse_product
+from mtgdb.cardmarket.parsers import extract_products_list, parse_product
 from mtgdb.db.models.cardmarket_import_file import CardmarketImportFile
 from mtgdb.db.models.cardmarket_product import CardmarketProduct
-from mtgdb.db.models.cardmarket_product_localization import CardmarketProductLocalization
 
 log = logging.getLogger("cardmarket.product_catalog")
 BATCH_SIZE = 1000
@@ -38,7 +37,6 @@ def import_product_catalog(
     rows_imported = 0
     errors = 0
     product_batch: list[dict] = []
-    loc_batch: list[dict] = []
 
     def flush() -> None:
         nonlocal rows_imported
@@ -65,22 +63,9 @@ def import_product_catalog(
             },
         )
         session.execute(stmt)
-
-        if loc_batch:
-            loc_stmt = pg_insert(CardmarketProductLocalization).values(loc_batch)
-            loc_stmt = loc_stmt.on_conflict_do_update(
-                index_elements=["id_product", "id_language"],
-                set_={
-                    "language_name": loc_stmt.excluded.language_name,
-                    "product_name":  loc_stmt.excluded.product_name,
-                },
-            )
-            session.execute(loc_stmt)
-
         session.commit()
         rows_imported += len(product_batch)
         product_batch.clear()
-        loc_batch.clear()
 
     for raw in products:
         try:
@@ -89,7 +74,6 @@ def import_product_catalog(
                 errors += 1
                 continue
             product_batch.append(parsed)
-            loc_batch.extend(parse_localizations(raw, parsed["id_product"]))
         except Exception as exc:
             errors += 1
             log.warning(f"  [PARSE] produit ignoré : {exc}")
