@@ -19,6 +19,7 @@ from mtgdb.db.base import Base
 if TYPE_CHECKING:
     from mtgdb.db.models.card_face import CardFace
     from mtgdb.db.models.card_printing import CardPrinting
+    from mtgdb.db.models.card_tag import CardTag
 
 
 def normalize_card_name(name: str) -> str:
@@ -72,6 +73,9 @@ class Card(Base):
     )
     printings: Mapped[List["CardPrinting"]] = relationship(
         "CardPrinting", back_populates="card", lazy="select"
+    )
+    tags: Mapped[List["CardTag"]] = relationship(
+        "CardTag", back_populates="card", cascade="all, delete-orphan", lazy="select"
     )
     def __repr__(self) -> str:
         return f"<Card oracle_id={self.oracle_id!r} name={self.name!r}>"
