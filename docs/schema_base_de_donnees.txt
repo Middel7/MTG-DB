@@ -24,19 +24,19 @@ Base : PostgreSQL | Hôte : localhost:5432 | Base : manamind | User : postgres
 │      colors[], color_identity[], keywords[]                  │
 │      legal_commander, game_changer, edhrec_rank              │
 │      created_at, updated_at                                  │
-└──────────┬─────────────────────────────────────────────────┐─┘
-           │ id (1)                                          │ id (1)
-           │                                                 │
-           │ card_id (N)                                     │ card_id (N)
-┌──────────▼──────────────────────────────────┐  ┌──────────▼────────────┐
-│ scryfall_card_printings                     │  │ scryfall_card_faces   │
-│  PK  id                                     │  │  PK  id               │
-│  UQ  scryfall_id                            │  │      card_id  ────────►
-│      card_id   → scryfall_cards.id          │  │      face_name        │
-│      set_code  → scryfall_mtg_sets.code     │  │      mana_cost        │
-│      cardmarket_id → cardmarket_products    │  │      type_line        │
-│        (propagé à toutes les langues)       │  │      oracle_text      │
-│      oracle_id                              │  │      power            │
+└──────────┬─────────────────────────────────────────────────┬──────────────────────────────────────┐
+           │ id (1)                                          │ id (1)                               │ id (1)
+           │                                                 │                                      │
+           │ card_id (N)                                     │ card_id (N)                          │ card_id (N)
+┌──────────▼──────────────────────────────────┐  ┌──────────▼────────────┐  ┌─────────────────────▼──────────────┐
+│ scryfall_card_printings                     │  │ scryfall_card_faces   │  │ scryfall_card_tags                 │
+│  PK  id                                     │  │  PK  id               │  │  PK  id                            │
+│  UQ  scryfall_id                            │  │      card_id  ────────►  │  FK  card_id → scryfall_cards.id   │
+│      card_id   → scryfall_cards.id          │  │      face_name        │  │      tag_name                      │
+│      set_code  → scryfall_mtg_sets.code     │  │      mana_cost        │  │  UQ  (card_id, tag_name)           │
+│      cardmarket_id → cardmarket_products    │  │      type_line        │  │      Source: tagger.scryfall.com   │
+│        (propagé à toutes les langues)       │  │      oracle_text      │  │      (ORACLE_CARD_TAG uniquement)  │
+│      oracle_id                              │  │      power            │  └────────────────────────────────────┘
 │      collector_number                       │  │      toughness        │
 │      lang, rarity, released_at, artist      │  │      colors[]         │
 │      border_color, frame                    │  │      image_small      │
@@ -112,6 +112,7 @@ LIENS ENTRE TABLES
                                                                          les langues via
                                                                          card_id+set_code+
                                                                          collector_number)
+  scryfall_card_tags.card_id              →  scryfall_cards.id          FK CASCADE
   scryfall_card_faces.card_id             →  scryfall_cards.id          FK CASCADE
   scryfall_card_prices.printing_id        →  scryfall_card_printings.id FK CASCADE
   cardmarket_price_guide_entries          →  cardmarket_products        FK SET NULL
@@ -131,6 +132,11 @@ SCRIPTS D'IMPORT
                                            de cardmarket_id aux impressions non-
                                            anglaises (même carte, même édition,
                                            même collector_number)
+  scripts/import_tagger_tags.py            Import tags oracle depuis Scryfall Tagger
+                                           (API GraphQL non officielle)
+                                           --all : remplace les tags existants
+                                           --limit N : limite à N cartes (test)
+                                           Par défaut : cartes sans tags uniquement
   scripts/import_cardmarket_products.py    Import Product Catalog Cardmarket
   scripts/import_cardmarket_price_guide.py Import Price Guide Cardmarket
   scripts/import_cardmarket_all.py         Import Cardmarket complet
