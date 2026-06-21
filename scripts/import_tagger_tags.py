@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from urllib.parse import quote
 from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -50,7 +51,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
-    stream=sys.stdout,
+    stream=open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1, closefd=False),
 )
 log = logging.getLogger("import_tagger_tags")
 
@@ -107,7 +108,7 @@ def graphql_request(
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-CSRF-Token": csrf_token,
-        "Referer": f"{TAGGER_BASE}/card/{set_code}/{collector_number}",
+        "Referer": f"{TAGGER_BASE}/card/{set_code}/{quote(collector_number)}",
         "Origin": TAGGER_BASE,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
