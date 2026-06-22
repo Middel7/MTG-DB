@@ -145,6 +145,46 @@ SCRIPTS D'IMPORT
 
 
 ================================================================================
+NOTES — cardmarket_price_guide_entries
+================================================================================
+
+  Structure foil/non-foil
+  ───────────────────────
+  Foil et non-foil sont sur la MÊME ligne (colonnes séparées).
+  Cardmarket utilise un seul id_product par carte — les prix foil
+  et non-foil coexistent dans la même entrée.
+
+  Mapping JSON → colonnes
+  ───────────────────────
+  Clé JSON            Colonne BDD
+  avg                 avg_price
+  low                 low_price
+  trend               trend_price
+  avg-foil            foil_sell
+  low-foil            foil_low
+  trend-foil          foil_trend
+  avg1-foil           foil_avg1
+  avg7-foil           foil_avg7
+  avg30-foil          foil_avg30
+
+  Règle NULL
+  ──────────
+  Les valeurs à 0 dans le JSON sont stockées NULL en base.
+  Cardmarket renvoie 0 pour "pas de données" (aucune vente),
+  pas un prix réel. Géré dans parsers.py (_decimal_or_none).
+
+  Taux de remplissage observé (143 398 entrées — 2026-06-07)
+  ──────────────────────────────────────────────────────────
+  low_price    : 97.6%  — disponible dès qu'une offre est active
+  trend_price  : 89.0%  — absent si jamais vendu
+  avg_price    : 84.7%  — absent si pas assez de ventes récentes
+  foil_low     : 55.8%  — ~56% des produits ont une version foil
+  foil_trend   : 60.9%  — légèrement plus (calculé sur historique)
+  foil_sell    : 44.4%  — absent si pas assez de ventes foil
+  tout NULL    :  1.4%  — produits sans activité (vieilles cartes)
+
+
+================================================================================
 VUES
 ================================================================================
 

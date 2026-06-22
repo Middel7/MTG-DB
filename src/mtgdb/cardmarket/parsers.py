@@ -77,16 +77,16 @@ _PRICE_KEY_MAP = {
     "trend_price":     ("trend", "Trend", "trendPrice", "trend_price", "TREND"),
     "german_pro_low":  ("germanProLow", "german_pro_low", "GermanProLow"),
     "suggested_price": ("suggestedPrice", "suggested_price", "SuggestedPrice", "sell", "Sell"),
-    "foil_sell":       ("foilSell", "foil_sell", "FoilSell"),
-    "foil_low":        ("foilLow", "foil_low", "FoilLow", "Foil Low"),
-    "foil_trend":      ("foilTrend", "foil_trend", "FoilTrend", "Foil Trend"),
+    "foil_sell":       ("avg-foil", "foilSell", "foil_sell", "FoilSell"),
+    "foil_low":        ("low-foil", "foilLow", "foil_low", "FoilLow", "Foil Low"),
+    "foil_trend":      ("trend-foil", "foilTrend", "foil_trend", "FoilTrend", "Foil Trend"),
     "low_price_ex_plus": ("lowEx", "lowPriceExPlus", "low_price_ex_plus", "Low Price Ex+", "lowExPlus"),
     "avg1":            ("avg1", "Avg1", "AVG1"),
     "avg7":            ("avg7", "Avg7", "AVG7"),
     "avg30":           ("avg30", "Avg30", "AVG30"),
-    "foil_avg1":       ("foilAvg1", "foil_avg1", "FoilAvg1"),
-    "foil_avg7":       ("foilAvg7", "foil_avg7", "FoilAvg7"),
-    "foil_avg30":      ("foilAvg30", "foil_avg30", "FoilAvg30"),
+    "foil_avg1":       ("avg1-foil", "foilAvg1", "foil_avg1", "FoilAvg1"),
+    "foil_avg7":       ("avg7-foil", "foilAvg7", "foil_avg7", "FoilAvg7"),
+    "foil_avg30":      ("avg30-foil", "foilAvg30", "foil_avg30", "FoilAvg30"),
 }
 
 
@@ -141,6 +141,8 @@ def _decimal_or_none(val: Any) -> Optional[Decimal]:
         s = str(val).strip().replace(",", ".")
         if not s:
             return None
-        return Decimal(s)
+        d = Decimal(s)
+        # Cardmarket renvoie 0 pour "pas de données", pas un prix réel
+        return None if d == 0 else d
     except (InvalidOperation, ValueError):
         return None
