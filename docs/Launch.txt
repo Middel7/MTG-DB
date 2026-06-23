@@ -1,3 +1,4 @@
 cd "c:\Users\fabie\Documents\GitHub\MTG-DB"
 
 $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python scripts/import_tagger_tags.py
+
