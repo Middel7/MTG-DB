@@ -36,13 +36,14 @@ Base : PostgreSQL | Hôte : localhost:5432 | Base : manamind | User : postgres
 │      set_code  → scryfall_mtg_sets.code     │  │      mana_cost        │  │  UQ  (card_id, tag_name)           │
 │      cardmarket_id → cardmarket_products    │  │      type_line        │  │      Source: tagger.scryfall.com   │
 │        (propagé à toutes les langues)       │  │      oracle_text      │  │      (ORACLE_CARD_TAG uniquement)  │
-│      oracle_id                              │  │      power            │  └────────────────────────────────────┘
-│      collector_number                       │  │      toughness        │
-│      lang, rarity, released_at, artist      │  │      colors[]         │
-│      border_color, frame                    │  │      image_small      │
-│      full_art, promo, reprint, digital      │  │      image_normal     │
-│      image_small/normal/large               │  │      image_large      │
-│      scryfall_uri                           │  └───────────────────────┘
+│      tcgplayer_id  (nullable)               │  │      power            │  └────────────────────────────────────┘
+│      oracle_id                              │  │      toughness        │
+│      collector_number                       │  │      colors[]         │
+│      lang, rarity, released_at, artist      │  │      image_small      │
+│      border_color, frame                    │  │      image_normal     │
+│      full_art, promo, reprint, digital      │  │      image_large      │
+│      image_small/normal/large               │  └───────────────────────┘
+│      scryfall_uri                           │
 │      printed_name  (nom traduit, nullable)  │
 │      Source: Scryfall all_cards             │
 └──────────┬──────────────────────────────────┘
@@ -58,7 +59,7 @@ Base : PostgreSQL | Hôte : localhost:5432 | Base : manamind | User : postgres
 │      price_type        │      game_name, category_name            │
 │      price             │      number, rarity, expansion_name      │
 │      date              │      raw_json                            │
-│  UQ (printing_id,      │      first/last_seen_at, created_at     │
+│  UQ (printing_id,      │      first/last_seen_at, created_at      │
 │   date, source,        └──────────┬───────────────────────────────┘
 │   currency,                       │ id_product (1)
 │   price_type)                     │
