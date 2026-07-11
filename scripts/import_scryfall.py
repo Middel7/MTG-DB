@@ -360,6 +360,28 @@ def propagate_cardmarket_ids(session: Session) -> int:
     return result.rowcount
 
 
+def propagate_tcgplayer_id_en(session: Session) -> int:
+    """
+    Renseigne tcgplayer_id_en sur toutes les impressions en copiant le tcgplayer_id
+    de l'impression anglaise (lang='en') ayant le même set_code + collector_number.
+    Les impressions sans équivalent anglais restent NULL.
+    """
+    from sqlalchemy import text as sa_text
+    result = session.execute(sa_text("""
+        UPDATE scryfall_card_printings AS target
+        SET tcgplayer_id_en = source.tcgplayer_id
+        FROM scryfall_card_printings AS source
+        WHERE source.lang = 'en'
+          AND source.tcgplayer_id IS NOT NULL
+          AND target.set_code = source.set_code
+          AND target.collector_number = source.collector_number
+          AND (target.tcgplayer_id_en IS NULL
+               OR target.tcgplayer_id_en != source.tcgplayer_id)
+    """))
+    session.commit()
+    return result.rowcount
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. TRAITEMENT PAR BATCH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -551,6 +573,10 @@ def main() -> None:
                 propagated = propagate_cardmarket_ids(session)
                 log.info(f"  {propagated:,} impression(s) mise(s) à jour.")
 
+                log.info("Propagation des tcgplayer_id_en (ID anglais vers toutes les langues)...")
+                propagated_tcg = propagate_tcgplayer_id_en(session)
+                log.info(f"  {propagated_tcg:,} impression(s) mise(s) à jour.")
+
                 elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
                 run.status = "success"
                 run.finished_at = datetime.now(timezone.utc)
@@ -564,6 +590,7 @@ def main() -> None:
                 log.info(f"  Cartes          : {cards_n:>10,}")
                 log.info(f"  Impressions     : {printings_n:>10,}")
                 log.info(f"  CM id propagés  : {propagated:>10,}")
+                log.info(f"  TCG id_en prop. : {propagated_tcg:>10,}")
                 log.info(f"  Éditions        : {n_sets:>10,}")
                 log.info(f"  Erreurs         : {errors_n:>10}")
                 log.info(f"  Durée           : {elapsed:>9}s")

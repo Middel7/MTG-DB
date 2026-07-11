@@ -52,6 +52,7 @@ class CardPrinting(Base):
     scryfall_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     tcgplayer_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    tcgplayer_id_en: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     printed_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
 
     card: Mapped["Card"] = relationship("Card", back_populates="printings")
