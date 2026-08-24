@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -41,12 +42,20 @@ class CardPrinting(Base):
     # que 0,9 % de taille (GIN n'indexe pas les NULL de toute façon) et obligerait
     # le planner à prouver l'implication du prédicat pour chaque requête. Voir
     # docs/recherche_trigram.md.
+    #
+    # Index fonctionnel sur lower(printed_name) : sert la résolution de decklist
+    # de RELIC-Trade (deck_resolution.py:114 et :401), qui compare en minuscules.
+    # Un index sur la colonne brute lui est inaccessible — c'est une expression.
     __table_args__ = (
         Index(
             "ix_scryfall_card_printings_printed_name_trgm",
             "printed_name",
             postgresql_using="gin",
             postgresql_ops={"printed_name": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_scryfall_card_printings_printed_name_lower",
+            text("lower(printed_name)"),
         ),
     )
 
@@ -82,7 +91,10 @@ class CardPrinting(Base):
     cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     tcgplayer_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     tcgplayer_id_en: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
-    printed_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    # Pas d'`index=True` : le btree sur la colonne brute ne servait aucune requête
+    # des consommateurs (tous en ILIKE ou lower()). Supprimé par la migration
+    # 20260824_printed_name_lower. Les deux index utiles sont en __table_args__.
+    printed_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     card: Mapped["Card"] = relationship("Card", back_populates="printings")
     mtg_set: Mapped[Optional["MtgSet"]] = relationship("MtgSet", back_populates="printings")

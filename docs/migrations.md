@@ -93,12 +93,19 @@ proposait de le **supprimer**. Il est désormais déclaré (`index=True`) et con
 |---|---|
 | `20260713_rename_legacy_indexes` | Alignement des noms d'index sur les tables préfixées (voir ci-dessus) |
 | `20260824_printed_name_trgm` | Extension `pg_trgm` + index GIN trigram sur `scryfall_card_printings.printed_name`, en `CREATE INDEX CONCURRENTLY`. Recherche par nom traduit : de 645 Mo lus par requête à quelques Ko. Mesures, bench d'import et exploitation : [`recherche_trigram.md`](recherche_trigram.md) |
+| `20260824_printed_name_lower` | Index fonctionnel `lower(printed_name)` pour la résolution de decklist (261 ms → 0,0 ms), et retrait du btree `ix_scryfall_card_printings_printed_name` qu'aucun consommateur ne pouvait utiliser. Bilan : −14 Mo |
 
-> Cette dernière est la première migration du dépôt à sortir de la transaction
-> (`autocommit_block`) et à se garder sur `pg_index.indisvalid` pour rester rejouable :
+> Ces deux migrations sont les premières du dépôt à sortir de la transaction
+> (`autocommit_block`) et à se garder sur `pg_index.indisvalid` pour rester rejouables :
 > `CREATE INDEX CONCURRENTLY` n'est pas transactionnel et laisse un index **INVALID**
 > derrière lui en cas d'échec. S'en inspirer pour tout futur index sur une grosse table.
 >
-> Elle rappelle aussi la règle des index déclarés : **tout index créé en migration doit
+> Elles rappellent la règle des index déclarés : **tout index créé en migration doit
 > l'être aussi dans le modèle**, avec le même nom — sinon `--autogenerate` proposera de
-> le supprimer à chaque génération.
+> le supprimer à chaque génération. Un index d'expression se déclare avec
+> `Index("nom", text("lower(colonne)"))` et ne produit, lui non plus, aucun bruit.
+>
+> Enfin : **avant de supprimer un index, lire le code des applications qui lisent la
+> base**, pas seulement `idx_scan`. C'est le code de ManaMind_AI et de RELIC-Trade qui a
+> établi qu'aucune requête n'atteignait `printed_name` par sa valeur brute — un compteur
+> à zéro n'aurait prouvé qu'une absence d'usage *récent*.
