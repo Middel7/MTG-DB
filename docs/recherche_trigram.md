@@ -1,6 +1,12 @@
-# Recherche par nom traduit — index GIN trigram
+# Recherche par nom traduit — indexation de `printed_name`
 
-> Migration `20260824_printed_name_trgm` · mesuré le 24/08/2026 sur PostgreSQL 18.4
+> Migrations `20260824_printed_name_trgm` et `20260824_printed_name_lower`
+> · mesuré le 24/08/2026 sur PostgreSQL 18.4
+>
+> Deux index servent cette colonne, et ils ne se recouvrent pas : le **GIN
+> trigram** pour les `ILIKE` à joker (recherche et autocomplétion), l'index
+> **fonctionnel `lower()`** pour les égalités de la résolution de decklist. Un
+> btree sur la colonne brute, qui ne servait ni l'un ni l'autre, a été supprimé.
 
 ## Le problème
 
@@ -168,40 +174,61 @@ cette migration (un `VACUUM FULL` ou `pg_repack` le résorberait, au prix d'un
 `ACCESS EXCLUSIVE` qui bloquerait les deux applications lectrices) — signalé ici,
 pas traité.
 
-## Le btree `ix_scryfall_card_printings_printed_name` : à supprimer, mais pas encore
+## `lower(printed_name)` : index fonctionnel, et retrait du btree
 
-Ce btree de 26 Mo ne peut servir **aucune** des requêtes du consommateur : `ILIKE`
-lui est inaccessible, et les `lower(printed_name) = …` portent sur une expression.
-L'audit côté RELIC-Trade conclut qu'il est inutile, et les compteurs vont dans le
-même sens — 18 scans pour 5 863 492 tuples lus, soit 325 000 tuples par scan :
-la signature de parcours quasi complets, pas de lookups d'égalité.
+> Migration `20260824_printed_name_lower`
 
-**Il n'a pas été supprimé**, car les deux réserves posées lors de la décision ne
-sont pas levées :
+### Ce que font réellement les consommateurs
 
-1. La confirmation doit venir de la **production**, pas de cette base locale dont
-   les compteurs étaient pollués par les requêtes d'analyse. Les compteurs des
-   deux index `printed_name` ont été remis à zéro le 24/08/2026 pour permettre
-   l'observation :
+La question « le btree sert-il à quelqu'un ? » a été tranchée non par les
+compteurs, mais par le **code des deux applications qui lisent la base** :
 
-   ```sql
-   SELECT pg_stat_reset_single_table_counters('ix_scryfall_card_printings_printed_name'::regclass);
-   -- puis, après quelques jours d'usage réel :
-   SELECT indexrelname, idx_scan, idx_tup_read
-     FROM pg_stat_user_indexes
-    WHERE relname = 'scryfall_card_printings' AND indexrelname LIKE '%printed_name%';
-   ```
+| Application | Code | Forme | Btree utilisable ? |
+|---|---|---|---|
+| ManaMind_AI | `routers/collection.py:401` | `printed_name.ilike(f"{q}%")` | ✗ ILIKE est insensible à la casse |
+| RELIC-Trade | `services/deck_resolution.py:114` | `func.lower(printed_name) == …` | ✗ porte sur une expression |
+| RELIC-Trade | `services/deck_resolution.py:401` | `func.lower(printed_name).in_(…)` | ✗ porte sur une expression |
 
-   ⚠️ Passer l'OID de **l'index**, pas celui de la table : la fonction ne
-   réinitialise que la relation qu'on lui désigne.
+**Aucun accès à `printed_name` par sa valeur brute.** Le btree
+`ix_scryfall_card_printings_printed_name` coûtait 26 Mo et une écriture à chaque
+import, pour zéro lecture possible. Les compteurs disaient la même chose — 18
+scans pour 5 863 492 tuples lus, soit 325 000 tuples par scan, la signature de
+parcours quasi complets et non de lookups d'égalité.
 
-2. **ManaMind_AI lit la même base** et n'a pas été consulté. La question doit lui
-   être posée avant toute suppression.
+Il a été **supprimé**, et remplacé par l'index qui manquait vraiment.
 
-Si `idx_scan` reste à 0 en production et que ManaMind_AI ne s'y oppose pas, le
-supprimer par une migration dédiée — geste unique : retirer `index=True` de
-`printed_name` dans `src/mtgdb/db/models/card_printing.py` **et** le
-`DROP INDEX CONCURRENTLY` correspondant.
+### L'index fonctionnel
+
+```sql
+CREATE INDEX CONCURRENTLY ix_scryfall_card_printings_printed_name_lower
+    ON scryfall_card_printings (lower(printed_name));
+```
+
+Il sert la résolution de decklist de RELIC-Trade, jusque-là en `Seq Scan` :
+
+| Requête | Avant | Après | Gain |
+|---|---|---|---|
+| `lower(printed_name) = …` (`deck_resolution.py:114`) | 261,5 ms · 82 491 buffers | **0,0 ms · 4 buffers** | table entière → 4 blocs |
+| `lower(printed_name) IN (…)` (`deck_resolution.py:401`) | 283,6 ms · 82 491 buffers | **0,0 ms · 15 buffers** | idem |
+
+Contrôle que le retrait du btree ne coûte rien à ManaMind_AI — sa requête
+d'autocomplétion exacte, jointure comprise, s'exécute en **2,3 ms** (628 buffers)
+en passant par l'index trigram : la forme ancrée `ILIKE 'q%'` exploite les
+trigrammes de padding.
+
+### Bilan d'espace : on a gagné en supprimant
+
+| | |
+|---|---|
+| Btree supprimé | −26 Mo |
+| Index fonctionnel créé | +12 Mo |
+| **Net** | **−14 Mo**, et deux requêtes de 260 ms passées sous la milliseconde |
+
+Le nouvel index fait 12 Mo là où le btree en occupait 26 pour les mêmes lignes :
+même cause que pour le trigram, l'ancien index avait accumulé de la fragmentation
+au fil des imports, le nouveau est neuf.
+
+Total des index de la table : 243 → **228 Mo** ; total table : 887 → **873 Mo**.
 
 ## Exploitation
 
@@ -235,9 +262,15 @@ et RELIC-Trade : si l'un d'eux crée un jour ses propres index trigram, un
 `DROP EXTENSION pg_trgm CASCADE` les détruirait **en silence**. Une extension
 orpheline ne coûte rien.
 
-## Hors périmètre — signalé, non traité
+## Sujet ouvert : le bloat de la table
 
-`lower(printed_name) = …`, chemin de repli de la résolution de decklist côté
-RELIC-Trade, fait un seq scan à 542 ms. **Le GIN trigram ne le couvre pas** : c'est
-une égalité sur une expression. Un index fonctionnel sur `lower(printed_name)` le
-rendrait instantané, mais c'est une autre migration.
+`scryfall_card_printings` porte ~300 Mo d'espace libre accumulé par les
+réécritures successives de l'import — 645 Mo de heap contre 340 Mo pour des
+données identiques restaurées à neuf. C'est ce qui fait que l'index trigram pèse
+38 Mo au lieu de 19.
+
+**Non traité à dessein.** Un `VACUUM FULL` reconstruirait table et index d'un
+coup, mais prend un `ACCESS EXCLUSIVE` qui gèlerait RELIC-Trade et ManaMind_AI
+pendant toute la réécriture. À planifier dans une fenêtre de maintenance, ou à
+remplacer par `pg_repack` (non installé) qui travaille sans verrou exclusif.
+Une piste moins brutale : régler un autovacuum plus agressif sur cette table.
