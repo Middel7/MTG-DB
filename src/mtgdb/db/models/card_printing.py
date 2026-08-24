@@ -7,7 +7,16 @@ from __future__ import annotations
 from datetime import date
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import BigInteger, Boolean, Date, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from mtgdb.db.base import Base
@@ -20,6 +29,26 @@ if TYPE_CHECKING:
 
 class CardPrinting(Base):
     __tablename__ = "scryfall_card_printings"
+
+    # Index GIN trigram servant les recherches ILIKE à joker de RELIC-Trade sur
+    # le nom traduit. Déclaré ici — et pas seulement dans la migration
+    # 20260824_printed_name_trgm — pour que --autogenerate le reconnaisse : un
+    # index créé en migration mais absent des modèles se voit proposer à la
+    # suppression à chaque génération. Le nom doit rester rigoureusement
+    # identique à celui de la migration.
+    #
+    # Volontairement NON partiel : un `WHERE printed_name IS NOT NULL` ne gagne
+    # que 0,9 % de taille (GIN n'indexe pas les NULL de toute façon) et obligerait
+    # le planner à prouver l'implication du prédicat pour chaque requête. Voir
+    # docs/recherche_trigram.md.
+    __table_args__ = (
+        Index(
+            "ix_scryfall_card_printings_printed_name_trgm",
+            "printed_name",
+            postgresql_using="gin",
+            postgresql_ops={"printed_name": "gin_trgm_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     scryfall_id: Mapped[str] = mapped_column(
