@@ -156,23 +156,48 @@ quel que soit son prédicat : il faudrait un index fonctionnel sur l'expression
 elle-même. Le retrait du prédicat se justifie par le principe — ne pas payer une
 contrainte pour un gain mesuré nul — et non par ce cas précis.
 
-## Taille de l'index, et une observation annexe
+## Taille de l'index
 
-L'index occupe **38 Mo** : les index de la table passent de 205 à 243 Mo, et son
-total de 850 à 887 Mo (+4,4 %).
+L'index occupe **36 Mo** après compactage de la table (voir ci-dessous).
 
-Sur la table restaurée à neuf du cluster jetable, **le même index sur les mêmes
-528 180 lignes ne fait que 19 Mo**. L'écart ne vient pas du build `CONCURRENTLY`
-(vérifié : 19 Mo dans les deux modes), mais du **bloat de la table
-de travail** : 645 Mo de heap contre 340 Mo pour des données identiques. Les TID
-y sont étalés sur deux fois plus de pages, ce qui dégrade la compression par delta
-des posting lists du GIN.
+### Une hypothèse qui a été testée, puis INFIRMÉE
 
-Autrement dit, la table porte ~300 Mo d'espace libre accumulé par les réécritures
-successives de l'import, et cet index en paie le prix. C'est un sujet distinct de
-cette migration (un `VACUUM FULL` ou `pg_repack` le résorberait, au prix d'un
-`ACCESS EXCLUSIVE` qui bloquerait les deux applications lectrices) — signalé ici,
-pas traité.
+Sur la table restaurée à neuf du cluster jetable, le même index sur les mêmes
+528 180 lignes ne faisait que **19 Mo**. On a d'abord attribué l'écart au bloat de
+la table de travail — 645 Mo de heap contre 340 Mo pour des données identiques —
+en supposant que des TID étalés sur deux fois plus de pages dégradaient la
+compression par delta des posting lists du GIN.
+
+**La mesure a démenti cette explication.** Un `VACUUM FULL` a été passé sur la
+table le 2026-08-24 :
+
+| | Avant | Après |
+|---|---|---|
+| Heap | 645 Mo | **310 Mo** (−52 %) |
+| Tous les index | 228 Mo | **119 Mo** (−48 %) |
+| **Index trigram** | 38 Mo | **36 Mo** (−5 %) |
+
+Le heap est descendu *sous* les 340 Mo du cluster jetable, et l'index trigram n'a
+pratiquement pas bougé. Le bloat n'était donc pas la cause. Les autres index,
+eux, ont bien été divisés par deux — c'est spécifiquement le GIN trigram qui ne
+se compacte pas.
+
+**L'écart 36 Mo / 19 Mo reste inexpliqué à ce jour.** Une piste non vérifiée : le
+cluster de bench avait été créé avec `initdb --locale=C`, là où la base de travail
+utilise une locale UTF-8. `pg_trgm` passe les valeurs en minuscules selon la
+locale avant d'extraire les trigrammes, ce qui peut changer le nombre de
+trigrammes distincts sur des noms accentués — la table contient des noms dans
+toutes les langues. À confirmer avant d'en faire une conclusion.
+
+Ne pas propager l'explication par le bloat : elle est fausse.
+
+### Le REINDEX, lui, compacte
+
+En production, un `REINDEX INDEX CONCURRENTLY` après le rechargement de 528 180
+lignes a ramené l'index trigram de **59 à 33 Mo en 81 s**, sans bloquer le site.
+C'est le bon outil quand un GIN a grossi sous l'effet de réécritures massives —
+contrairement au `VACUUM FULL`, qui traite le heap mais laisse ce type d'index
+presque inchangé.
 
 ## `lower(printed_name)` : index fonctionnel, et retrait du btree
 
@@ -262,15 +287,46 @@ et RELIC-Trade : si l'un d'eux crée un jour ses propres index trigram, un
 `DROP EXTENSION pg_trgm CASCADE` les détruirait **en silence**. Une extension
 orpheline ne coûte rien.
 
-## Sujet ouvert : le bloat de la table
+## Le bloat de la table : traité en local le 2026-08-24
 
-`scryfall_card_printings` porte ~300 Mo d'espace libre accumulé par les
-réécritures successives de l'import — 645 Mo de heap contre 340 Mo pour des
-données identiques restaurées à neuf. C'est ce qui fait que l'index trigram pèse
-38 Mo au lieu de 19.
+`scryfall_card_printings` portait ~300 Mo d'espace libre accumulé par les
+réécritures successives de l'import. Un `VACUUM FULL` l'a résorbé **en 24 s** sur
+la base locale : heap 645 → 310 Mo, index 228 → 119 Mo, total 873 → **429 Mo**.
 
-**Non traité à dessein.** Un `VACUUM FULL` reconstruirait table et index d'un
-coup, mais prend un `ACCESS EXCLUSIVE` qui gèlerait RELIC-Trade et ManaMind_AI
-pendant toute la réécriture. À planifier dans une fenêtre de maintenance, ou à
-remplacer par `pg_repack` (non installé) qui travaille sans verrou exclusif.
-Une piste moins brutale : régler un autovacuum plus agressif sur cette table.
+L'opération prend un `ACCESS EXCLUSIVE` : la table est inaccessible pendant toute
+la réécriture. 24 s en local, mais il faut compter bien davantage sur une
+instance modeste — et cela gèlerait RELIC-Trade et ManaMind_AI. En production, la
+faire dans une fenêtre de maintenance, ou passer par `pg_repack` (non installé),
+qui travaille sans verrou exclusif.
+
+> À ne pas confondre : le `VACUUM FULL` compacte le heap et les btree, mais laisse
+> le GIN trigram quasiment inchangé (−5 %). Pour celui-là, l'outil est
+> `REINDEX INDEX CONCURRENTLY`, qui l'a ramené de 59 à 33 Mo en production.
+
+## La recherche lente en production n'est PAS un problème d'index
+
+Mesuré le 2026-08-24 sur l'API publique, après application des deux migrations,
+rafraîchissement du catalogue **et** REINDEX :
+
+| Requête API | Temps |
+|---|---|
+| `island` | 1,4 s |
+| `goblin` | 12,6 s |
+| `dragon` | 12,5 s |
+
+Alors qu'**en base**, la même recherche est instantanée : `printed_name ILIKE
+'%goblin%'` renvoie ses 1 042 lignes en **3,6 ms** par `Bitmap Index Scan`.
+
+Le coût est ailleurs :
+
+- l'instance Render est **12,7× plus lente** que le poste local en CPU pur
+  (2 M `md5()` : 4,33 s contre 0,34 s), avec `work_mem` à 1,6 Mo,
+  `shared_buffers` à 64 Mo et `effective_cache_size` à 192 Mo ;
+- `search_grouped` évalue `relevance_rank_clause` sur **~5 000 impressions** pour
+  « goblin » (3 909 par le nom anglais, 1 042 par le nom traduit), puis agrège en
+  `GROUP BY oracle_id`. C'est du CPU et du tri, pas de la recherche d'index.
+
+**Ne pas chercher la solution du côté de l'indexation** : trois interventions
+successives (index trigram, index fonctionnel, REINDEX) n'ont pas fait bouger
+`goblin`. Les pistes réelles sont le dimensionnement de l'instance et
+l'optimisation de la requête de pertinence, toutes deux côté RELIC-Trade.
