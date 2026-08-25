@@ -3,10 +3,10 @@
 Import des cartes Magic: The Gathering depuis Scryfall bulk data vers PostgreSQL.
 
 Flux :
-  1. GET https://api.scryfall.com/bulk-data  → download_uri du fichier default_cards
-  2. Téléchargement → data/raw/scryfall/<filename>
+  1. GET https://api.scryfall.com/bulk-data  → jsonl_download_uri du fichier all_cards
+  2. Purge des anciens bulks, puis téléchargement → data/raw/scryfall/<filename>
   3. GET https://api.scryfall.com/sets       → upsert dans mtg_sets (FK obligatoire)
-  4. Parsing streaming ijson → batches de 500 cartes :
+  4. Parsing streaming JSONL gzippé → batches de 500 cartes :
        cards / card_faces / card_printings / card_prices
   5. Mise à jour import_runs (début, fin, compteurs, erreurs)
 
@@ -18,6 +18,8 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import gzip
+import json
 import logging
 import sys
 from datetime import date, datetime, timezone
@@ -26,7 +28,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import ijson
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -37,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.rawfiles import purge_old_files
 from mtgdb.db.models.card import Card, normalize_card_name
 from mtgdb.db.models.card_face import CardFace
 from mtgdb.db.models.card_price import CardPrice
@@ -64,15 +66,74 @@ log = logging.getLogger("import_scryfall")
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_bulk_metadata(client: httpx.Client) -> tuple[str, str, datetime]:
+    """
+    URI, nom de fichier et date de publication du bulk `all_cards`.
+
+    Scryfall a remplacé `download_uri` (tableau JSON de 2,4 Go) par
+    `jsonl_download_uri` (JSONL gzippé, ~374 Mo). L'ancien champ a purement
+    disparu de la réponse : le lire produisait un KeyError, ce qui a bloqué
+    l'import du 28/07 au 25/08/2026 sans que rien ne le signale.
+
+    On ne retombe volontairement PAS sur `download_uri` : ce champ n'existe plus,
+    et un repli silencieux masquerait un nouveau changement d'API. Mieux vaut
+    échouer bruyamment avec un message qui nomme le champ manquant.
+    """
     resp = client.get(BULK_DATA_URL)
     resp.raise_for_status()
     for item in resp.json().get("data", []):
         if item.get("type") == "all_cards":
             updated_at = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00"))
-            uri: str = item["download_uri"]
+            uri = item.get("jsonl_download_uri")
+            if not uri:
+                raise ValueError(
+                    "Le bulk 'all_cards' n'expose pas 'jsonl_download_uri' — l'API "
+                    f"Scryfall a probablement encore changé. Champs reçus : "
+                    f"{sorted(item.keys())}"
+                )
             filename = uri.rsplit("/", 1)[-1]
             return uri, filename, updated_at
-    raise ValueError("Type 'default_cards' introuvable dans l'API bulk-data Scryfall.")
+    raise ValueError("Type 'all_cards' introuvable dans l'API bulk-data Scryfall.")
+
+
+def _iter_bulk_cards(file_path: Path):
+    """
+    Itère les cartes du bulk, une par ligne.
+
+    Le bulk est désormais du JSONL gzippé : un objet JSON complet par ligne,
+    et non plus un unique tableau JSON. `ijson.items(f, "item")` ne sait pas le
+    lire — mais on n'en a plus besoin, la lecture ligne par ligne est déjà
+    naturellement en streaming, et plus rapide.
+
+    `gzip.open` décompresse à la volée : le fichier n'est jamais développé sur
+    disque (374 Mo compressés contre ~2,4 Go décompressés).
+    """
+    with gzip.open(file_path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip().rstrip(",")
+            # Tolère d'éventuels crochets si Scryfall revenait à un tableau.
+            if not line or line in ("[", "]"):
+                continue
+            yield json.loads(line)
+
+
+def bulk_already_imported(session: Session, download_uri: str) -> bool:
+    """
+    True si ce bulk exact a déjà été importé avec succès.
+
+    Scryfall ne publie qu'un bulk par jour et son nom porte un horodatage unique :
+    comparer source_file suffit à savoir si l'import a déjà été fait. Permet aux
+    runs planifiés répétés de ne pas re-parser 2,4 Go pour rien.
+    """
+    stmt = (
+        select(ImportRun.id)
+        .where(
+            ImportRun.source == "scryfall",
+            ImportRun.status == "success",
+            ImportRun.source_file == download_uri,
+        )
+        .limit(1)
+    )
+    return session.execute(stmt).first() is not None
 
 
 def download_bulk_file(client: httpx.Client, url: str, dest: Path) -> None:
@@ -450,38 +511,37 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
     file_size_mb = file_path.stat().st_size / 1_048_576
     log.info(f"Fichier : {file_path.name} ({file_size_mb:.0f} Mo)")
 
-    with open(file_path, "rb") as f:
-        for raw_card in ijson.items(f, "item"):
-            try:
-                card_row = _parse_card_row(raw_card)
-                if card_row is None:
-                    continue
-                card_rows_buf.append(card_row)
-                raw_cards_buf.append(raw_card)
-            except Exception as exc:
-                errors_count += 1
-                log.warning(f"[PARSE] '{raw_card.get('name', '?')}': {exc}")
+    for raw_card in _iter_bulk_cards(file_path):
+        try:
+            card_row = _parse_card_row(raw_card)
+            if card_row is None:
                 continue
+            card_rows_buf.append(card_row)
+            raw_cards_buf.append(raw_card)
+        except Exception as exc:
+            errors_count += 1
+            log.warning(f"[PARSE] '{raw_card.get('name', '?')}': {exc}")
+            continue
 
-            if len(card_rows_buf) >= BATCH_SIZE:
-                try:
-                    c, p = _flush_batch(session, card_rows_buf, raw_cards_buf, today)
-                    cards_imported += c
-                    printings_imported += p
-                except Exception as exc:
-                    log.error(f"[BATCH] cards {cards_imported}–{cards_imported + BATCH_SIZE}: {exc}")
-                    session.rollback()
-                    errors_count += len(card_rows_buf)
-                finally:
-                    card_rows_buf = []
-                    raw_cards_buf = []
+        if len(card_rows_buf) >= BATCH_SIZE:
+            try:
+                c, p = _flush_batch(session, card_rows_buf, raw_cards_buf, today)
+                cards_imported += c
+                printings_imported += p
+            except Exception as exc:
+                log.error(f"[BATCH] cards {cards_imported}–{cards_imported + BATCH_SIZE}: {exc}")
+                session.rollback()
+                errors_count += len(card_rows_buf)
+            finally:
+                card_rows_buf = []
+                raw_cards_buf = []
 
-                if cards_imported > 0 and cards_imported % 2_000 == 0:
-                    log.info(
-                        f"  -> {cards_imported:>6,} cartes  |  "
-                        f"{printings_imported:>6,} impressions  |  "
-                        f"{errors_count} erreurs"
-                    )
+            if cards_imported > 0 and cards_imported % 2_000 == 0:
+                log.info(
+                    f"  -> {cards_imported:>6,} cartes  |  "
+                    f"{printings_imported:>6,} impressions  |  "
+                    f"{errors_count} erreurs"
+                )
 
     if card_rows_buf:
         try:
@@ -505,9 +565,13 @@ def main() -> None:
         description="Importe les cartes MTG depuis Scryfall bulk data vers PostgreSQL."
     )
     parser.add_argument("--force", action="store_true",
-                        help="Retélécharge le fichier même s'il existe déjà.")
+                        help="Retélécharge et réimporte même si ce bulk a déjà été importé.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse sans insérer en base.")
+    parser.add_argument("--keep-bulks", type=int, default=1, metavar="N",
+                        help="Nombre de fichiers bulk à conserver sur disque (défaut : 1).")
+    parser.add_argument("--no-purge", action="store_true",
+                        help="Ne supprime pas les anciens fichiers bulk.")
     args = parser.parse_args()
 
     if not args.dry_run and not check_connection():
@@ -530,7 +594,28 @@ def main() -> None:
         log.info(f"  Source   : {filename}")
         log.info(f"  Scryfall : mis à jour le {source_updated_at.strftime('%Y-%m-%d %H:%M UTC')}")
 
+        # Ce bulk est-il déjà en base ? Si oui, inutile de le retélécharger ni de le
+        # re-parser : on sort en succès. C'est ce qui rend les runs planifiés répétés
+        # (2×/jour) quasi gratuits quand Scryfall n'a rien republié.
+        if not args.dry_run and not args.force:
+            with SessionLocal() as session:
+                if bulk_already_imported(session, download_uri):
+                    log.info("Ce bulk a déjà été importé avec succès — rien à faire.")
+                    log.info("  (--force pour réimporter malgré tout)")
+                    if not args.no_purge:
+                        purge_old_files(RAW_DIR, keep=args.keep_bulks, current=filename, logger=log)
+                    return
+
         dest = RAW_DIR / filename
+
+        # Purge AVANT le téléchargement : les anciens bulks sont déjà importés, les garder
+        # pendant le parsing (5 à 18 min) ferait cohabiter 2×2,6 Go sur le disque pour rien.
+        # `filename` est réservé dans le budget `keep`, donc un téléchargement partiel déjà
+        # présent survit et reste réutilisable.
+        if not args.no_purge and not args.dry_run:
+            log.info("Purge des anciens fichiers bulk...")
+            purge_old_files(RAW_DIR, keep=args.keep_bulks, current=filename, logger=log)
+
         if dest.exists() and not args.force:
             log.info(f"Fichier déjà présent ({dest.stat().st_size / 1_048_576:.0f} Mo). Utilise --force pour retélécharger.")
         else:
@@ -540,11 +625,10 @@ def main() -> None:
         if args.dry_run:
             log.info("[DRY-RUN] Comptage sans insertion...")
             count = 0
-            with open(dest, "rb") as f:
-                for _ in ijson.items(f, "item"):
-                    count += 1
-                    if count % 5_000 == 0:
-                        log.info(f"  {count:,} objets parsés...")
+            for _ in _iter_bulk_cards(dest):
+                count += 1
+                if count % 5_000 == 0:
+                    log.info(f"  {count:,} objets parsés...")
             log.info(f"[DRY-RUN] Total : {count:,} objets.")
             return
 
