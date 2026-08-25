@@ -23,23 +23,32 @@ BATCH_SIZE = 2000
 
 def purge_old_captures(session: Session, keep: int) -> int:
     """
-    Ne conserve que les `keep` captures de prix les plus récentes. Retourne le
-    nombre de lignes supprimées.
+    Ne conserve que les `keep` relevés les plus récents **par produit**. Retourne
+    le nombre de lignes supprimées.
 
-    Une capture pèse ~62 Mo en base (~126 000 lignes, une par produit). Un import
-    quotidien fait donc croître la table de ~23 Go par an. C'est soutenable sur un
-    poste de développement, où l'historique sert à comparer des relevés ; ça ne
-    l'est pas sur une base hébergée facturée au stockage.
+    ⚠️ RÉSERVÉ AU POSTE LOCAL. En production, la rétention de cette table est un
+    arbitrage métier de RELIC-Trade — c'est son API qui la lit, et une purge
+    pilotée depuis le dépôt qui écrit serait invisible depuis celui qui lit.
+    RELIC-Trade la traite par son propre `apps/api/scripts/purge_price_history.py`.
+    Ne pas activer `--keep-captures` sur un run visant la production.
 
-    Or les consommateurs ne lisent QUE la capture la plus récente : côté
-    RELIC-Trade, toutes les lectures de prix prennent l'entrée de `captured_at`
-    maximal. L'historique n'y est lu nulle part.
+    Une capture pèse ~62 Mo (~126 000 lignes, une par produit) ; en quotidien, la
+    table croît de ~23 Go par an. En local, l'historique sert à comparer des
+    relevés — d'où le choix, ici, d'un réglage plutôt que d'une suppression
+    systématique.
+
+    POURQUOI PAR PRODUIT ET NON PAR DATE
+    Purger globalement — « supprimer tout ce qui n'est pas dans les N derniers
+    `captured_at` » — efface le prix d'un produit absent de ces N derniers
+    imports. Cardmarket publie un catalogue complet à chaque fois, mais un
+    produit retiré du catalogue verrait son dernier prix connu disparaître, sans
+    moyen de le reconstituer : Cardmarket ne republie pas ses relevés passés.
+    On garde donc les `keep` derniers relevés DE CHAQUE produit.
 
     `keep=0` désactive la purge — c'est le défaut, pour ne rien supprimer sans
     demande explicite.
 
-    ⚠️ Suppression DÉFINITIVE : l'historique effacé ne peut pas être reconstitué,
-    Cardmarket ne republiant pas ses relevés passés.
+    ⚠️ Suppression DÉFINITIVE.
     """
     if keep <= 0:
         return 0
@@ -51,26 +60,33 @@ def purge_old_captures(session: Session, keep: int) -> int:
         log.info(f"  Purge des captures : {total_captures} capture(s) ≤ {keep} — rien à faire.")
         return 0
 
-    # Les captures à conserver sont désignées explicitement plutôt que calculées
-    # par un NOT IN sur un OFFSET : plus lisible dans les logs, et le plan reste
-    # un simple parcours d'index sur captured_at.
-    keep_dates = session.scalars(
-        select(CardmarketPriceGuideEntry.captured_at)
-        .distinct()
-        .order_by(CardmarketPriceGuideEntry.captured_at.desc())
-        .limit(keep)
-    ).all()
+    # row_number() par produit : chaque id_product conserve ses `keep` relevés
+    # les plus récents, quelle que soit leur date. Un produit qui n'apparaît que
+    # dans un import ancien garde donc sa ligne.
+    ranked = (
+        select(
+            CardmarketPriceGuideEntry.id,
+            func.row_number()
+            .over(
+                partition_by=CardmarketPriceGuideEntry.id_product,
+                order_by=CardmarketPriceGuideEntry.captured_at.desc(),
+            )
+            .label("rn"),
+        )
+        .subquery()
+    )
+    doomed = select(ranked.c.id).where(ranked.c.rn > keep)
 
     deleted = session.execute(
         CardmarketPriceGuideEntry.__table__
         .delete()
-        .where(CardmarketPriceGuideEntry.captured_at.notin_(keep_dates))
+        .where(CardmarketPriceGuideEntry.id.in_(doomed))
     ).rowcount
     session.commit()
 
     log.info(
-        f"  Purge des captures : {total_captures - keep} capture(s) supprimée(s), "
-        f"{deleted:,} ligne(s) — {keep} conservée(s)."
+        f"  Purge des captures : {deleted:,} ligne(s) supprimée(s) — "
+        f"{keep} relevé(s) conservé(s) par produit."
     )
     return deleted
 
