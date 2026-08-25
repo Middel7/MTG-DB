@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,60 @@ from mtgdb.db.models.cardmarket_price_guide_entry import CardmarketPriceGuideEnt
 
 log = logging.getLogger("cardmarket.price_guide")
 BATCH_SIZE = 2000
+
+
+def purge_old_captures(session: Session, keep: int) -> int:
+    """
+    Ne conserve que les `keep` captures de prix les plus récentes. Retourne le
+    nombre de lignes supprimées.
+
+    Une capture pèse ~62 Mo en base (~126 000 lignes, une par produit). Un import
+    quotidien fait donc croître la table de ~23 Go par an. C'est soutenable sur un
+    poste de développement, où l'historique sert à comparer des relevés ; ça ne
+    l'est pas sur une base hébergée facturée au stockage.
+
+    Or les consommateurs ne lisent QUE la capture la plus récente : côté
+    RELIC-Trade, toutes les lectures de prix prennent l'entrée de `captured_at`
+    maximal. L'historique n'y est lu nulle part.
+
+    `keep=0` désactive la purge — c'est le défaut, pour ne rien supprimer sans
+    demande explicite.
+
+    ⚠️ Suppression DÉFINITIVE : l'historique effacé ne peut pas être reconstitué,
+    Cardmarket ne republiant pas ses relevés passés.
+    """
+    if keep <= 0:
+        return 0
+
+    total_captures = session.scalar(
+        select(func.count(func.distinct(CardmarketPriceGuideEntry.captured_at)))
+    ) or 0
+    if total_captures <= keep:
+        log.info(f"  Purge des captures : {total_captures} capture(s) ≤ {keep} — rien à faire.")
+        return 0
+
+    # Les captures à conserver sont désignées explicitement plutôt que calculées
+    # par un NOT IN sur un OFFSET : plus lisible dans les logs, et le plan reste
+    # un simple parcours d'index sur captured_at.
+    keep_dates = session.scalars(
+        select(CardmarketPriceGuideEntry.captured_at)
+        .distinct()
+        .order_by(CardmarketPriceGuideEntry.captured_at.desc())
+        .limit(keep)
+    ).all()
+
+    deleted = session.execute(
+        CardmarketPriceGuideEntry.__table__
+        .delete()
+        .where(CardmarketPriceGuideEntry.captured_at.notin_(keep_dates))
+    ).rowcount
+    session.commit()
+
+    log.info(
+        f"  Purge des captures : {total_captures - keep} capture(s) supprimée(s), "
+        f"{deleted:,} ligne(s) — {keep} conservée(s)."
+    )
+    return deleted
 
 
 def import_price_guide(
