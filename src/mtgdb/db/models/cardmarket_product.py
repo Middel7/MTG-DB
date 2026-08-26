@@ -22,10 +22,22 @@ class CardmarketProduct(Base):
         Index("ix_cardmarket_products_expansion_name", "expansion_name"),
         Index("ix_cardmarket_products_number", "number"),
         Index("ix_cardmarket_products_id_metaproduct", "id_metaproduct"),
+        Index("ix_cardmarket_products_id_expansion", "id_expansion"),
     )
 
     id_product: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     id_metaproduct: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # Édition Cardmarket du produit. C'est le SEUL champ du Product Catalog qui
+    # sépare deux produits de même nom : Cardmarket ne fournit dans ce fichier ni
+    # `expansion_name`, ni `number`, ni `rarity` — ces colonnes existent mais
+    # restent vides pour les 121 190 produits.
+    #
+    # Sert au diagnostic, pas au filtrage : un set Scryfall se répartit
+    # légitimement sur plusieurs expansions Cardmarket (`otj` en compte trois, à
+    # cause de Breaking News et Big Score). Rejeter un prix sur une simple
+    # discordance d'expansion donnerait 886 faux positifs pour 10 détections —
+    # mesuré. Voir docs/liaison_cardmarket.md.
+    id_expansion: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     count_reprints: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     en_name: Mapped[str] = mapped_column(Text, nullable=False)
     website: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
