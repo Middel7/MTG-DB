@@ -1,0 +1,38 @@
+# Service de mise à jour de la base MTG-DB.
+#
+# Le conteneur est lancé en ONE-SHOT (il fait le job puis s'arrête). Il ne tourne
+# pas en permanence : le profil "tools" l'exclut de `docker compose up`.
+#
+#   docker compose run --rm updater                # mise à jour complète
+#   docker compose run --rm updater --skip tags    # run quotidien rapide (~7 min)
+#   docker compose run --rm updater --only tags    # run hebdomadaire des tags
+#   docker compose run --rm updater --dry-run      # plan sans exécution
+#
+# Planification en production — cron de l'hôte (voir docs/deploiement.md) :
+#   0 8,20 * * *  cd /opt/mtg-db && docker compose run --rm updater --skip tags
+#   0 3   * * 0   cd /opt/mtg-db && docker compose run --rm updater --only tags
+
+services:
+  updater:
+    build: .
+    image: mtgdb-updater:latest
+    profiles: ["tools"] # n'est jamais démarré par `docker compose up`
+    restart: "no" # one-shot : ne surtout pas relancer en boucle
+    environment:
+      # Fourni par l'environnement de l'hôte ou un secret — jamais commité.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL est requis}
+      TZ: ${TZ:-Europe/Paris}
+    volumes:
+      # Persiste les bulks Scryfall entre les runs : sans ce volume, chaque
+      # exécution retéléchargerait 2,4 Go depuis zéro.
+      - scryfall_raw:/app/data
+      - ./logs:/app/logs
+    # Si PostgreSQL tourne dans un autre compose, rattacher son réseau ici :
+    # networks:
+    #   - manamind
+    # networks:
+    #   manamind:
+    #     external: true
+
+volumes:
+  scryfall_raw:

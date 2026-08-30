@@ -36,8 +36,9 @@ Base : PostgreSQL | Hôte : localhost:5432 | Base : manamind | User : postgres
 │      set_code  → scryfall_mtg_sets.code     │  │      mana_cost        │  │  UQ  (card_id, tag_name)           │
 │      cardmarket_id → cardmarket_products    │  │      type_line        │  │      Source: tagger.scryfall.com   │
 │        (propagé à toutes les langues)       │  │      oracle_text      │  │      (ORACLE_CARD_TAG uniquement)  │
-│      tcgplayer_id  (nullable)               │  │      power            │  └────────────────────────────────────┘
-│      oracle_id                              │  │      toughness        │
+│      tcgplayer_id     (nullable)            │  │      power            │  └────────────────────────────────────┘
+│      tcgplayer_id_en  (nullable, propagé)   │  │      toughness        │
+│      oracle_id                              │  │      loyalty, defense │
 │      collector_number                       │  │      colors[]         │
 │      lang, rarity, released_at, artist      │  │      image_small      │
 │      border_color, frame                    │  │      image_normal     │
@@ -126,13 +127,24 @@ LIENS ENTRE TABLES
 SCRIPTS D'IMPORT
 ================================================================================
 
+  scripts/update_all.py                    ★ ORCHESTRATEUR — mise à jour COMPLÈTE
+                                           Enchaîne les 4 sources dans l'ordre :
+                                           Scryfall → Cardmarket → Game Changers
+                                           → Tags Tagger. Rapport final par étape.
+                                           Lanceur : .\update.ps1 (racine du projet)
+                                           Options : --skip/--only ÉTAPE, --force,
+                                           --tags-all, --stop-on-error, --dry-run
   scripts/import_scryfall.py               Import Scryfall (cartes, éditions,
                                            prix Scryfall, cardmarket_id,
-                                           printed_name) — source : all_cards
-                                           Étape finale : propagation automatique
-                                           de cardmarket_id aux impressions non-
-                                           anglaises (même carte, même édition,
-                                           même collector_number)
+                                           tcgplayer_id, printed_name)
+                                           source : all_cards
+                                           Étapes finales : propagation automatique
+                                           de cardmarket_id ET tcgplayer_id_en aux
+                                           impressions non-anglaises (même set_code
+                                           + collector_number). tcgplayer_id_en
+                                           copie le tcgplayer_id de l'impression
+                                           anglaise (lang='en') vers toutes les
+                                           langues de la même édition.
   scripts/import_tagger_tags.py            Import tags oracle depuis Scryfall Tagger
                                            (API GraphQL non officielle)
                                            --all : remplace les tags existants
@@ -196,5 +208,27 @@ VUES
                low_price, trend_price, low_price_ex_plus,
                avg1, avg7, avg30, foil_low, foil_trend,
                foil_avg1, foil_avg7, foil_avg30, captured_at
+
+
+================================================================================
+STATISTIQUES DE DECKLISTS COMMANDER  (deck_stat_*)
+================================================================================
+
+  Modèles SQLAlchemy présents dans le repo, MAIS alimentés par un script externe
+  (compute_deck_stats.py) qui ne fait PAS partie de ce dépôt. Ces tables ne sont
+  donc pas touchées par update_all.py — elles proviennent d'un dataset de decks
+  Commander importé séparément.
+
+  deck_stat_global      Fréquence globale d'une carte, tous commandants confondus
+    PK id · UQ card_name · decks_count, total_decks, global_frequency (%)
+    commanders_count, idf, computed_at
+
+  deck_stat_commander   Fréquence d'une carte pour UN commandant donné
+    PK id · UQ (commander, card_name)
+    decks_with_card, total_decks, inclusion_rate (%), computed_at
+
+  (Le docstring du modèle mentionne une table deck_stat_idf, mais elle n'existe
+   PAS en base — l'IDF est aujourd'hui stocké dans la colonne idf de
+   deck_stat_global. Référence obsolète à ignorer.)
 
 ================================================================================

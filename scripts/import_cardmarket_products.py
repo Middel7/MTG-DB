@@ -15,6 +15,7 @@ from mtgdb.cardmarket import PRODUCT_CATALOG_URL
 from mtgdb.cardmarket.download import download_file
 from mtgdb.cardmarket.import_product_catalog import import_product_catalog
 from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.rawfiles import purge_old_files
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,7 @@ logging.basicConfig(
 log = logging.getLogger("import_cardmarket_products")
 
 RAW_DIR = ROOT / "data" / "raw" / "cardmarket" / "product_catalog"
+KEEP_DOWNLOADS = 2
 
 
 def main() -> None:
@@ -41,11 +43,13 @@ def main() -> None:
 
             if file_path is None:
                 log.info("Fichier non modifié — import ignoré.")
+                purge_old_files(RAW_DIR, keep=KEEP_DOWNLOADS, logger=log)
                 return
 
             log.info("Import en base…")
             n = import_product_catalog(file_path, session, import_row)
             log.info(f"Terminé — {n:,} produits importés.")
+            purge_old_files(RAW_DIR, keep=KEEP_DOWNLOADS, current=file_path.name, logger=log)
 
 
 if __name__ == "__main__":

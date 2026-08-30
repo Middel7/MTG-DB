@@ -76,7 +76,7 @@ def update_database(game_changer_names: list[str], dry_run: bool = False) -> Non
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
-        result = conn.execute(text("UPDATE cards SET game_changer = false"))
+        result = conn.execute(text("UPDATE scryfall_cards SET game_changer = false"))
         print(f"[DB] Reset game_changer=false sur {result.rowcount} cartes.")
 
         updated = 0
@@ -84,14 +84,14 @@ def update_database(game_changer_names: list[str], dry_run: bool = False) -> Non
 
         for name in game_changer_names:
             r = conn.execute(
-                text("UPDATE cards SET game_changer = true WHERE name = :n"), {"n": name}
+                text("UPDATE scryfall_cards SET game_changer = true WHERE name = :n"), {"n": name}
             )
             if r.rowcount > 0:
                 updated += r.rowcount
             else:
                 norm = _normalize(name)
                 r2 = conn.execute(
-                    text("UPDATE cards SET game_changer = true WHERE normalized_name = :n"),
+                    text("UPDATE scryfall_cards SET game_changer = true WHERE normalized_name = :n"),
                     {"n": norm},
                 )
                 if r2.rowcount > 0:
@@ -106,7 +106,7 @@ def update_database(game_changer_names: list[str], dry_run: bool = False) -> Non
                 print(f"  - {n}")
 
         total = conn.execute(
-            text("SELECT COUNT(*) FROM cards WHERE game_changer = true")
+            text("SELECT COUNT(*) FROM scryfall_cards WHERE game_changer = true")
         ).scalar()
         print(f"[DB] Total game_changer=true en base : {total}")
 

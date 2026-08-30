@@ -1,0 +1,22 @@
+# Données brutes : plusieurs Go, régénérées par le conteneur
+data/
+logs/
+
+# Environnements locaux
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Git & IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Docs (inutiles à l'exécution)
+docs/
+README.md
+update.ps1
