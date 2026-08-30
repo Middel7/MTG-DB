@@ -56,7 +56,7 @@ class Card(Base):
     legal_commander: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     edhrec_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     game_changer: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False, server_default="false"
+        Boolean, default=False, nullable=False, server_default="false", index=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

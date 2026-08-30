@@ -38,7 +38,8 @@ class CardmarketPriceGuideEntry(Base):
         BigInteger,
         ForeignKey("cardmarket_products.id_product", ondelete="SET NULL"),
         nullable=True,
-        index=True,
+        # Pas de index=True ici : l'index est déclaré explicitement dans __table_args__
+        # (ix_cm_price_guide_id_product). Le cumul des deux créerait un index en double.
     )
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

@@ -1,0 +1,702 @@
+# Rapport d'audit — MTG-DB (catalogue Magic) — 16 juillet 2026
+
+Audit **lecture seule** du dépôt `MTG-DB` (package Python `mtgdb`) et de l'instance PostgreSQL locale. Aucun fichier modifié, aucune écriture en base (sessions ouvertes en `SET SESSION READ ONLY`).
+
+## Résumé exécutif
+
+Trois faits commandent les deux décisions :
+
+1. **Le catalogue ne fait pas 15 Go, il fait 1,82 Go.** La base `manamind` pèse 15 Go, mais 13 Go appartiennent à **ManaMind_AI** (`deck_cards` seule = 12 Go). Dimensionner l'hébergeur sur « 15 Go » serait une erreur d'un facteur 8.
+2. **Les deux tables de prix sont append-only sans aucune purge** : +135 Mo/jour mesurés. À ce rythme, le catalogue atteint **~51 Go dans 12 mois**. C'est ça, et non la taille actuelle, qui décide du plan.
+3. **Les imports téléchargent 2,57 Go par run avec un pic disque de 5,1 Go**, alors qu'ils n'envoient que ~34 Mo vers la base. Le coût est côté *lecture Scryfall*, pas côté *écriture PostgreSQL* — ce qui rend le disque éphémère de Render rédhibitoire et la liaison Internet quasi gratuite.
+
+---
+
+## 1. Volumétrie
+
+### Tailles des bases — interrogé depuis `manamind` (vue `pg_database`, couvre l'instance entière)
+
+| datname | taille |
+|---|---|
+| manamind | 15 GB |
+| MTGTrade_DB | 8862 kB |
+| postgres | 7857 kB |
+
+`manamind` et `MTGTrade_DB` sont bien **deux bases distinctes de la même instance** `localhost:5432`.
+
+### Version
+
+```
+PostgreSQL 18.4 on x86_64-windows, compiled by msvc-19.44.35226, 64-bit
+```
+
+/!\ Le serveur est en **PostgreSQL 18.4**, pas 16. Ni Neon ni Render ne proposent 18 à ce jour — une migration implique donc une **descente de version** (18 -> 16/17). Aucun blocage identifié (voir §2), mais `pg_dump` doit être lancé avec le binaire de la version **cible**, pas avec celui de 18.
+
+### Tables de `manamind` (données + index)
+
+| relname | total | données | index | lignes | Propriétaire |
+|---|---|---|---|---|---|
+| deck_cards | 12 GB | 8956 MB | 3234 MB | 36 330 581 | ManaMind_AI |
+| scryfall_card_printings | 843 MB | 642 MB | 201 MB | 521 075 | **MTG-DB** |
+| deck_stat_commander | 796 MB | 371 MB | 426 MB | 3 480 214 | ManaMind_AI |
+| scryfall_card_prices | 468 MB | 198 MB | 270 MB | 2 710 343 | **MTG-DB** |
+| cardmarket_price_guide_entries | 361 MB | 273 MB | 87 MB | 644 569 | **MTG-DB** |
+| commander_clusters | 108 MB | 67 MB | 41 MB | 0 | ManaMind_AI |
+| cardmarket_products | 91 MB | 77 MB | 14 MB | 120 252 | **MTG-DB** |
+| card_neighbors | 70 MB | 51 MB | 19 MB | 634 600 | ManaMind_AI |
+| scryfall_cards | 59 MB | 47 MB | 12 MB | 38 261 | **MTG-DB** |
+| scryfall_card_tags | 32 MB | 12 MB | 20 MB | 225 963 (*) | **MTG-DB** |
+| deck_stat_global | 13 MB | 6720 kB | 6424 kB | 33 894 | ManaMind_AI |
+| card_tag_clusters | 12 MB | 7408 kB | 5080 kB | 85 638 | ManaMind_AI |
+| scryfall_card_faces | 5992 kB | 4888 kB | 1064 kB | 6 387 | **MTG-DB** |
+| user_collection | 1144 kB | 624 kB | 480 kB | 4 408 | RELIC ? |
+| scryfall_mtg_sets | 496 kB | 304 kB | 152 kB | 1 046 | **MTG-DB** |
+| user_deck_cards | 432 kB | 160 kB | 232 kB | 1 820 | RELIC ? |
+| users / invitations / user_opened_sets / user_moxfield_decks | < 100 kB | | | 2 / 1 / 21 / 22 | RELIC ? |
+| cardmarket_import_files | 128 kB | 16 kB | 80 kB | 20 | **MTG-DB** |
+| import_runs | 32 kB | 8192 bytes | 16 kB | 8 | **MTG-DB** |
+
+**Somme des tables `scryfall_*` + `cardmarket_*` = 1862 Mo (1,82 Go).** C'est le périmètre réel du catalogue.
+
+(*) La colonne « lignes » vient de `pg_stat_user_tables.n_live_tup`, une **estimation** dépendante du dernier `ANALYZE`. Elle s'est révélée fausse d'un facteur 300 sur `scryfall_card_tags` (773 estimées vs 225 963 réelles) — valeur corrigée ci-dessus. Vérification faite sur les 10 tables principales : toutes les autres sont exactes à moins de 0,3 % près. Les **tailles** (`pg_total_relation_size`) sont, elles, toujours exactes. Voir §7.7.
+
+### Croissance de `cardmarket_price_guide_entries`
+
+| lignes | produits | premier import | dernier import | jours distincts |
+|---|---|---|---|---|
+| 644 318 | 120 247 | 2026-06-07 13:05:32+02 | 2026-07-16 09:11:14+02 | 5 |
+
+| jour | lignes ajoutées |
+|---|---|
+| 2026-07-16 | 125 247 |
+| 2026-07-14 | 125 225 |
+| 2026-07-13 | 125 224 |
+| 2026-07-12 | 125 224 |
+| 2026-06-07 | 143 398 |
+
+### Croissance de `scryfall_card_prices`
+
+| date | lignes |
+|---|---|
+| 2026-07-16 | 340 569 |
+| 2026-07-15 | 340 569 |
+| 2026-07-14 | 340 700 |
+| 2026-07-13 | 340 643 |
+| 2026-07-12 | 340 634 |
+| 2026-07-10 | 340 070 |
+| 2026-06-09 | 340 396 |
+| 2026-06-07 | 330 161 |
+
+8 dates distinctes, du 2026-06-07 au 2026-07-16.
+
+### Extensions et vues
+
+| extname | extversion |
+|---|---|
+| plpgsql | 1.0 |
+
+Une seule vue : `public.v_cardmarket_latest_prices_by_printing`.
+
+### Projection à 12 mois
+
+Coût mesuré par ligne (total relation size / count) :
+
+- `scryfall_card_prices` : **181 octets/ligne** x 340 569 lignes/jour = **61,6 Mo/jour**
+- `cardmarket_price_guide_entries` : **587 octets/ligne** x 125 247 lignes/jour = **73,5 Mo/jour**
+
+**Total : ~135 Mo/jour -> ~4,1 Go/mois -> ~49 Go/an.**
+
+**Catalogue à 12 mois : 1,82 + 49 ~= 51 Go**, hors croissance du nombre de cartes (négligeable : ~2 000 nouvelles impressions/mois).
+
+Une précision qui compte : les 8 dates observées s'étalent sur 39 jours parce que les imports n'ont pas tourné quotidiennement au début. Le Planificateur installe désormais deux runs par jour (scripts/install_scheduled_tasks.ps1:69-70), et le garde-fou ETag/`source_file` ramène ça à **une capture effective par jour**. Les 135 Mo/jour sont donc le régime **à venir**, pas une moyenne passée sous-estimée.
+
+### Y a-t-il une purge ?
+
+**Non. Aucune.** Un `grep` sur `DELETE|delete(|retention|older_than` dans `src/` et `scripts/` ne remonte que deux suppressions *fonctionnelles* — les faces de carte remplacées (scripts/import_scryfall.py:365) et les tags remplacés (scripts/import_tagger_tags.py:208) — plus la purge des **fichiers** bulk sur disque (scripts/import_scryfall.py:98). Aucune rétention sur l'historique de prix : **les deux tables grossissent indéfiniment.**
+
+C'est le levier le plus rentable de tout cet audit. Si RELIC ne lit que la dernière photo — ce que suggère la vue `v_cardmarket_latest_prices_by_printing` — une rétention à 90 jours ramènerait la projection de **51 Go à ~14 Go**, et changerait la réponse à la décision 1.
+
+---
+
+## 2. Gestion du schéma
+
+### Création sur une base vierge
+
+Par **Alembic, dans ce dépôt**. Il n'y a ni `.sql` d'initialisation, ni appel à `Base.metadata.create_all()` dans le code de production.
+
+```bash
+# Chemin exact : alembic.ini + alembic/env.py, 14 révisions dans alembic/versions/
+export DATABASE_URL=postgresql://user:***@host:5432/manamind
+alembic upgrade head
+```
+
+La révision initiale est alembic/versions/20260602_1518_392e971f7759_init.py ; la tête actuelle passe par le merge alembic/versions/1b7a9f3835e5_merge_deck_stats_et_tcgplayer_id_en.py.
+
+### Tables de version Alembic — collision à surveiller
+
+MTG-DB utilise **`mtgdb_alembic_version`**, défini explicitement en alembic/env.py:44, avec un filtre `include_object` (alembic/env.py:54-63) qui empêche l'autogenerate de proposer un `drop_table()` sur les tables des autres projets. Ce garde-fou est correct et bien commenté.
+
+Mais l'état réel de la base est plus trouble que la doc. `manamind` contient **trois** tables de version :
+
+| table | lignes | contenu |
+|---|---|---|
+| `mtgdb_alembic_version` | 1 | (MTG-DB — la nôtre) |
+| `alembic_version` | **0** | ManaMind_AI |
+| `mtgtrade_alembic_version` | **0** | RELIC |
+
+Et `MTGTrade_DB` contient sa propre `mtgtrade_alembic_version`.
+
+Il n'y a **pas de collision** au sens strict — chaque projet a sa table, et le `version_table` de MTG-DB est isolé. En revanche, `mtgtrade_alembic_version` existe **dans les deux bases**, vide dans `manamind`. C'est la trace d'un `alembic upgrade` de RELIC lancé un jour contre la mauvaise base. Inoffensif aujourd'hui, mais c'est exactement le symptôme de la confusion décrite en §7.
+
+Note annexe : `alembic_version` (ManaMind_AI) est à **0 ligne** alors que la requête `SELECT version_num FROM alembic_version` renvoie `20260714_add_quantity` — l'écart vient de `n_live_tup` non rafraîchi par `ANALYZE`, pas d'une anomalie.
+
+### Index les plus lourds
+
+| relname | indexrelname | taille |
+|---|---|---|
+| deck_cards | deck_cards_pkey | 1572 MB |
+| deck_cards | ix_deck_cards_deck_id | 630 MB |
+| deck_cards | ix_deck_cards_card_name | 527 MB |
+| deck_cards | ix_deck_cards_commander | 505 MB |
+| deck_stat_commander | uq_deck_stat_commander_card | 219 MB |
+| **scryfall_card_prices** | **uq_card_prices_printing_date_type** | **161 MB** |
+| deck_stat_commander | deck_stat_commander_pkey | 76 MB |
+| deck_stat_commander | ix_deck_stat_commander_tfidf | 71 MB |
+| **scryfall_card_prices** | **card_prices_pkey** | **65 MB** |
+| **scryfall_card_printings** | **ix_scryfall_card_printings_scryfall_id** | **58 MB** |
+| deck_stat_commander | ix_deck_stat_commander_card_name | 32 MB |
+| deck_stat_commander | ix_deck_stat_commander_commander | 28 MB |
+| **scryfall_card_prices** | **ix_scryfall_card_prices_printing_id** | **28 MB** |
+| **cardmarket_price_guide_entries** | **ix_cm_price_guide_product_captured** | **27 MB** |
+| **scryfall_card_printings** | **ix_scryfall_card_printings_printed_name** | **26 MB** |
+
+Les quatre premiers (3,2 Go) appartiennent à ManaMind_AI. Côté catalogue, les index représentent **58 % de `scryfall_card_prices`** (270 Mo d'index pour 198 Mo de données) — conséquence de la contrainte `UNIQUE(printing_id, date, price_type)` qui garantit une photo par jour et par type.
+
+### Dépendance à PostgreSQL 16 ou à une extension ?
+
+**Non.** La seule extension est `plpgsql`, présente par défaut partout. Le schéma est du SQLAlchemy 2.0 standard (types `Integer`, `Numeric`, `Date`, `Text`, `BigInteger`, FK, contraintes uniques) et la seule construction dialectale est `postgresql.insert()` pour les upserts `ON CONFLICT` (scripts/import_scryfall.py:31), disponible depuis PostgreSQL 9.5.
+
+**Le schéma est portable sur PostgreSQL 14+ sans adaptation.** Neon (17) comme Render (16) conviennent.
+
+---
+
+## 3. Le pipeline d'imports
+
+### Vue d'ensemble
+
+L'orchestrateur est scripts/update_all.py (419 lignes), enveloppé par update.ps1. Il enchaîne quatre étapes déclarées en scripts/update_all.py:44-49 et lance chacune en **sous-processus** (`subprocess.Popen`, scripts/update_all.py:246) — chaque étape a donc son propre espace mémoire, ce qui plafonne le pic RAM à celui de l'étape la plus gourmande.
+
+Les entry points déclarés en pyproject.toml:16-22 :
+
+| entry point | cible |
+|---|---|
+| `mtgdb-import` | `mtgdb.scripts.import_scryfall:main` |
+| `mtgdb-game-changers` | `mtgdb.scripts.import_game_changers:main` |
+| `mtgdb-cm-products` | `scripts.import_cardmarket_products:main` |
+| `mtgdb-cm-prices` | `scripts.import_cardmarket_price_guide:main` |
+| `mtgdb-cm-link` | `scripts.link_cardmarket_to_scryfall:main` |
+| `mtgdb-cm-all` | `scripts.import_cardmarket_all:main` |
+
+/!\ **Ces entry points sont cassés.** `mtgdb-import` et `mtgdb-game-changers` pointent vers `mtgdb.scripts.*`, or `[tool.hatch.build.targets.wheel]` ne package que `src/mtgdb` (pyproject.toml:28) et il n'existe **aucun `src/mtgdb/scripts/`** — les scripts vivent dans `scripts/` à la racine. Les quatre autres pointent vers `scripts.*`, un répertoire non packagé lui non plus. **Aucune de ces commandes n'est fonctionnelle après un `pip install`.** Le pipeline réel s'invoque par chemin de fichier (`python scripts/update_all.py`), ce que fait l'orchestrateur (scripts/update_all.py:224) et le Dockerfile (`ENTRYPOINT ["python", "scripts/update_all.py"]`). Sans conséquence aujourd'hui, mais à savoir avant de compter sur `mtgdb-import` dans un cron Render.
+
+### Étape 1 — Scryfall
+
+| Champ | Valeur |
+|---|---|
+| **Commande exacte** | `python scripts/import_scryfall.py [--force] [--no-purge] [--keep-bulks N] [--dry-run]` |
+| **Fichier:ligne** | scripts/import_scryfall.py:561 (`main`), 688 lignes |
+| **Ce qu'il fait** | `GET api.scryfall.com/bulk-data` -> URI du bulk `all_cards` -> téléchargement -> `GET /sets` -> upsert `scryfall_mtg_sets` -> parsing streaming ijson -> upsert `scryfall_cards` / `scryfall_card_faces` / `scryfall_card_printings`, insert `scryfall_card_prices` -> propagation `cardmarket_id` et `tcgplayer_id_en` -> maj `import_runs` |
+| **Fréquence attendue** | 2x/jour (08:00 et 20:00, scripts/install_scheduled_tasks.ps1:69-70) ; ~1 run utile/jour en pratique |
+| **Durée réelle observée** | Table `import_runs`, 8 derniers runs : **5m12s, 5m22s, 8m07s, 5m17s, 5m38s, 6m22s, 8m14s, 18m26s** (le dernier, 2026-07-16). Quand le bulk est déjà importé : **0 à 9 s** (logs `update_*.log`) |
+| **Pic mémoire** | **Faible — streaming.** `ijson` (scripts/import_scryfall.py:29) parse en flux, batches de 500 (`BATCH_SIZE = 500`, ligne 50). Le fichier de 2,57 Go n'est jamais en RAM. Pic non mesuré directement mais structurellement borné à quelques dizaines de Mo -> **INCONNU précis, largement < 512 Mo** |
+| **Écrit sur le disque ?** | /!\ **OUI, massivement.** `data/raw/scryfall/` (ligne 49). Fichier actuel : `all-cards-20260715212942.json` = **2 569 975 967 octets (2,57 Go)**. **Pic disque = 5,1 Go** : le téléchargement (ligne 602) précède la purge (lignes 673-675), donc ancien + nouveau coexistent |
+| **Idempotent ?** | **Oui.** `bulk_already_imported()` (ligne 78) compare `import_runs.source_file` au `download_uri` et sort immédiatement — sans même télécharger. Les écritures sont des upserts `ON CONFLICT`. `scryfall_card_prices` est protégé par `UNIQUE(printing_id, date, price_type)` : rejouer le même jour ne duplique pas |
+| **Verrou anti-concurrence** | Oui, au niveau de l'orchestrateur uniquement (scripts/update_all.py:132) : `data/.update_all.lock` (PID + timestamp), vérification de vie du PID, péremption à 6 h. Lancé seul, `import_scryfall.py` n'a **aucun verrou** |
+| **Reprise sur échec** | **Partielle.** Commit par batch de 500 (ligne 496) -> les données déjà écrites survivent. Mais `import_runs` passe à `failed`, donc le run suivant **re-parse le fichier depuis le début** (les upserts rendent l'opération sûre, juste coûteuse). Le fichier déjà sur disque n'est pas retéléchargé (ligne 609). **Pas de reprise au batch près** |
+| **Volume réseau** | **2,57 Go** par run neuf ; **~5 ko** (un `GET /bulk-data`) si déjà importé |
+| **Transaction** | **Par lots.** Un commit tous les 500 cartes, plus des commits dédiés pour les sets (ligne 192) et les propagations (lignes 417, 439) |
+
+### Étape 2 — Cardmarket (produits + prix + liaison)
+
+| Champ | Valeur |
+|---|---|
+| **Commande exacte** | `python scripts/import_cardmarket_all.py` (ou séparément `import_cardmarket_products.py`, `import_cardmarket_price_guide.py`, `link_cardmarket_to_scryfall.py`) |
+| **Fichier:ligne** | scripts/import_cardmarket_all.py:38 ; imports en src/mtgdb/cardmarket/import_product_catalog.py et src/mtgdb/cardmarket/import_price_guide.py ; téléchargement mutualisé en src/mtgdb/cardmarket/download.py:46 |
+| **Ce qu'il fait** | Télécharge le Product Catalog puis le Price Guide depuis `downloads.s3.cardmarket.com` (src/mtgdb/cardmarket/__init__.py:1-2), les importe, puis produit un rapport de liaison Cardmarket <-> Scryfall |
+| **Fréquence attendue** | Idem (2x/jour, dans le même run) |
+| **Durée réelle observée** | Logs `update_*.log` : **17s, 21s, 28s, 33s, 38s**. Quasi nul si ETag inchangé |
+| **Pic mémoire** | /!\ **`json.load()` intégral** — src/mtgdb/cardmarket/import_price_guide.py:32 et src/mtgdb/cardmarket/import_product_catalog.py:32. **Mesuré avec `tracemalloc` sur les fichiers réels : 108 Mo (price guide, 125 247 entrées) et 99 Mo (product catalog).** Non cumulés — les deux imports sont séquentiels dans le même processus, mais `data` est libéré entre les deux. Pic effectif ~= **110 Mo**, RSS réel plus haut (surcoût interpréteur) mais **compatible 512 Mo** |
+| **Écrit sur le disque ?** | Oui, modérément. `data/raw/cardmarket/price_guide/` = **25,7 Mo/fichier** ; `data/raw/cardmarket/product_catalog/` = **20,0 Mo/fichier**. /!\ **Aucune purge** sur ces répertoires : 5 fichiers accumulés de chaque côté (**~228 Mo** aujourd'hui), croissance ~46 Mo/jour indéfiniment |
+| **Idempotent ?** | **Oui côté téléchargement**, via ETag (src/mtgdb/cardmarket/download.py:85) : `skipped_not_modified` sans télécharger. **Non côté modèle de données** : `cardmarket_price_guide_entries` est append-only, chaque import réussi ajoute une photo horodatée `captured_at` (src/mtgdb/db/models/cardmarket_price_guide_entry.py:44). C'est le design voulu, mais un ETag qui changerait deux fois dans la journée ajouterait deux photos |
+| **Verrou anti-concurrence** | Idem — orchestrateur uniquement |
+| **Reprise sur échec** | Commit par lots (`BATCH_SIZE = 2000` prix, `1000` produits) -> partiel conservé, mais reprise du fichier **depuis le début**. Le fichier téléchargé est réutilisé |
+| **Volume réseau** | **~46 Mo** par run complet ; ~2 requêtes HEAD (quelques ko) si inchangé |
+| **Transaction** | **Par lots** : commit tous les 2000 prix (src/mtgdb/cardmarket/import_price_guide.py:70) / 1000 produits |
+
+### Étape 3 — Game Changers
+
+| Champ | Valeur |
+|---|---|
+| **Commande exacte** | `python scripts/import_game_changers.py` |
+| **Fichier:ligne** | scripts/import_game_changers.py:60-64 (132 lignes) |
+| **Ce qu'il fait** | Positionne le flag `game_changer` sur les cartes (liste Commander) |
+| **Fréquence attendue** | À chaque run |
+| **Durée réelle observée** | **1s, 1s, 2s, 6s, 11s** (logs) |
+| **Pic mémoire** | Négligeable (liste de quelques dizaines de noms) |
+| **Écrit sur le disque ?** | Non |
+| **Idempotent ?** | Oui (UPDATE d'un flag) |
+| **Verrou / reprise** | Orchestrateur ; run trop court pour que la question se pose |
+| **Volume réseau** | Quelques ko |
+| **Transaction** | Un seul commit |
+| **Particularité** | /!\ **Seul script à charger `.env` par chemin absolu du dépôt** : `load_dotenv(ROOT / ".env")` (ligne 61), au lieu de passer par `mtgdb.db.engine`. Voir §4 |
+
+### Étape 4 — Tags Tagger
+
+| Champ | Valeur |
+|---|---|
+| **Commande exacte** | `python scripts/import_tagger_tags.py [--all]` |
+| **Fichier:ligne** | scripts/import_tagger_tags.py (316 lignes) |
+| **Ce qu'il fait** | Récupère les tags Scryfall Tagger -> `scryfall_card_tags`. Par défaut ne traite que les cartes sans tags ; `--all` retraite tout |
+| **Fréquence attendue** | **Hebdomadaire** — dimanche 03:00 (scripts/install_scheduled_tasks.ps1:82). Exclu du run quotidien (`--skip tags`) |
+| **Durée réelle observée** | Aucun log `--only tags` conservé, mais **déduite** : 2 610 cartes restantes x (0,2 s de `--delay` + ~0,3 s de requête) ~= **~22 min**. Cohérent avec les « ~40 min » de la doc (scripts/update_all.py:39). La table est **taguée à 90,3 %** (225 963 tags / 34 534 cartes) — l'étape fonctionne. Voir §7.7 |
+| **Pic mémoire** | Faible — traitement carte par carte, commit par lots de 100 (ligne 298). Non mesuré |
+| **Écrit sur le disque ?** | Non |
+| **Idempotent ?** | Oui — `delete` puis réinsertion par carte (ligne 208) |
+| **Volume réseau** | ~2 610 requêtes GraphQL par run hebdomadaire (quelques Mo). API Tagger **non officielle** — peut changer sans préavis (docstring ligne 18) |
+| **Transaction** | Commit tous les 100 cartes |
+| **Rate-limit** | Seule étape avec throttling : `--delay 0.2` (5 req/s) + backoff 10/15/20 s sur HTTP 429 (lignes 122-126) |
+
+### /!\ Le point critique : les écritures disque
+
+**Le bulk Scryfall pèse 2,57 Go et le pic disque atteint 5,1 Go.**
+
+Le détail qui fait la différence : le code demande le bulk de type **`all_cards`** (scripts/import_scryfall.py:70), pas `default_cards`. `all_cards` contient **toutes les impressions dans toutes les langues** (~2,6 Go) là où `default_cards` fait ~500 Mo. C'est un choix délibéré et nécessaire — la table `scryfall_card_printings` compte 521 075 lignes avec `printed_name`, ce qui exige les versions localisées.
+
+Sur Render, ces 2,57 Go arrivent sur un système de fichiers **éphémère** : chaque run neuf les retélécharge intégralement. Le volume nommé de docker-compose.yml:33-34 (`scryfall_raw:/app/data`) existe précisément pour éviter ça — son commentaire le dit : *« sans ce volume, chaque exécution retéléchargerait 2,4 Go depuis zéro »*. Render Cron Jobs ne propose pas de volume persistant.
+
+Nuance importante en faveur de Render, cependant : le garde-fou d'idempotence lit `import_runs` **en base**, pas le disque (scripts/import_scryfall.py:78-95), et sort **avant** le téléchargement. Un run sur bulk déjà importé coûte donc ~0 Go même sans disque persistant. Le disque éphémère ne fait mal que sur les runs **utiles** — c'est-à-dire une fois par jour, tous les jours.
+
+---
+
+## 4. Configuration et secrets
+
+### Variables d'environnement — liste exhaustive
+
+Un `grep` sur `getenv|environ|load_dotenv` dans `src/`, `scripts/` et `alembic/` ne remonte qu'**une seule variable applicative** :
+
+| Variable | Fichier:ligne | Défaut | Rôle |
+|---|---|---|---|
+| `DATABASE_URL` | src/mtgdb/db/engine.py:26 | **aucun** — si absent, `engine = None` et `SessionLocal = None` (lignes 31-33) ; `check_connection()` échoue proprement et le script sort en code 1 | Connexion PostgreSQL |
+| `DATABASE_URL` | scripts/import_game_changers.py:64 | aucun | Idem (lecture indépendante) |
+| `DATABASE_URL` | alembic/env.py:30 | fallback `alembic.ini` : `postgresql://user:pass@localhost/mtgdb` (placeholder inopérant) | Migrations |
+
+Variables d'infrastructure, non lues par le code applicatif :
+
+| Variable | Fichier:ligne | Défaut |
+|---|---|---|
+| `PYTHONIOENCODING` | scripts/update_all.py:237, Dockerfile:12, update.ps1:15 | forcé à `utf-8` |
+| `PYTHONUNBUFFERED` | Dockerfile:11 | `1` |
+| `TZ` | docker-compose.yml:25 | `Europe/Paris` |
+| `UV_LINK_MODE`, `UV_PROJECT_ENVIRONMENT` | Dockerfile:13-14 | `copy`, `/usr/local` |
+
+**Une seule variable à fournir en production : `DATABASE_URL`.** Format attendu, d'après .env.example:5 : `postgresql://utilisateur:motdepasse@hote:port/nom_base`. La valeur locale pointe vers `postgresql://postgres:***@localhost:5432/manamind`.
+
+/!\ Le pilote est `psycopg2-binary` (pyproject.toml:8), qui **ne comprend pas** le préfixe `postgres://` que certains hébergeurs (dont Render) fournissent encore, ni les paramètres exotiques. Neon impose `?sslmode=require` et un endpoint parfois encodé dans le mot de passe. Aucune normalisation de l'URL n'existe dans le code : la chaîne est passée telle quelle à `create_engine()` (src/mtgdb/db/engine.py:29). **À vérifier au premier essai de connexion cloud.**
+
+### Identifiants Scryfall / Cardmarket
+
+**Aucun.** Ni clé d'API, ni compte, ni OAuth.
+
+- **Scryfall** : `https://api.scryfall.com/bulk-data` et `/sets`, publics. Le seul en-tête est `User-Agent: MTG-DB/1.0 (educational project)` (scripts/import_scryfall.py:51).
+- **Cardmarket** : /!\ contre-intuitif mais vérifié — le pipeline **n'utilise pas l'API Cardmarket** (celle-ci exigerait OAuth 1.0a et une clé de développeur). Il tape deux fichiers publics sur S3 : `downloads.s3.cardmarket.com/productCatalog/productList/products_singles_1.json` et `.../priceGuide/price_guide_1.json` (src/mtgdb/cardmarket/__init__.py:1-2). Aucune authentification.
+
+**Rate-limits et conditions d'utilisation :**
+
+- Scryfall demande officiellement 50–100 ms entre requêtes et un `User-Agent` identifiant. Le pipeline fait **2 requêtes API par run** (`/bulk-data`, `/sets`) plus un téléchargement CDN — aucun risque. Le `User-Agent` est conforme. Scryfall demande aussi de ne pas retélécharger les bulks plus souvent que leur publication : le garde-fou `source_file` respecte ça.
+- Cardmarket : les fichiers S3 sont servis sans authentification, mais **je n'ai pas pu vérifier les CGU applicables à ces exports** (pas d'accès réseau engagé dans cet audit — voir §INCONNU). Le pipeline est poli : HEAD conditionnel + comparaison ETag (src/mtgdb/cardmarket/download.py:70-90), donc ~2 requêtes HEAD par run à vide.
+- **Aucun `sleep` / throttling** dans le code (`grep sleep` -> aucun résultat), ce qui est acceptable vu le très faible nombre de requêtes.
+
+### Comment le pipeline trouve-t-il sa base ?
+
+/!\ **Deux mécanismes différents cohabitent — et c'est là qu'est le piège conteneur.**
+
+**Mécanisme 1 — remontée depuis le cwd** (src/mtgdb/db/engine.py:19-24) :
+
+```python
+_cwd = Path.cwd()
+for _parent in [_cwd, *_cwd.parents]:
+    _dotenv = _parent / ".env"
+    if _dotenv.exists():
+        load_dotenv(_dotenv)
+        break
+DATABASE_URL = os.getenv("DATABASE_URL")
+```
+
+C'est bien un mécanisme **dépendant du répertoire de lancement**. **Mais il ne casse pas en conteneur**, pour deux raisons cumulées :
+
+1. Le `.env` est exclu de l'image — .dockerignore le liste, et Dockerfile:24-27 ne copie que `src/`, `scripts/`, `alembic/`, `alembic.ini`. Aucun `.env` n'existe donc dans `/app` ni dans ses parents. La boucle ne trouve rien, `os.getenv("DATABASE_URL")` lit la variable injectée par `docker compose` (docker-compose.yml:24). OK
+2. Même si un `.env` traînait, `load_dotenv()` a `override=False` par défaut : **la variable d'environnement gagne toujours** sur le fichier.
+
+Le vrai risque de ce mécanisme n'est pas le conteneur, c'est le **poste local** : lancer un script depuis un cwd situé dans un autre projet (RELIC, ManaMind_AI) ferait remonter le `.env` **de cet autre projet** et l'import écrirait dans la mauvaise base. Le `.env` de RELIC pointant vers `MTGTrade_DB`, un `cd ../RELIC && python ../MTG-DB/scripts/import_scryfall.py` importerait 500 000 impressions dans la base de RELIC. Rien n'empêche ça aujourd'hui.
+
+**Mécanisme 2 — chemin absolu du dépôt** (scripts/import_game_changers.py:61) : `load_dotenv(ROOT / ".env")`, où `ROOT` est déduit de `__file__`. Immunisé au cwd, mais **incohérent** avec le reste du pipeline. En conteneur, `/app/.env` n'existe pas -> `load_dotenv` échoue silencieusement -> `os.environ.get("DATABASE_URL")` prend le relais. OK — fonctionne, par chance plus que par conception.
+
+alembic/env.py:19 utilise le mécanisme 2, avec le même verdict.
+
+### Dépendances à Windows, chemins absolus, ressources locales
+
+| Élément | Fichier:ligne | Bloquant en conteneur ? |
+|---|---|---|
+| `ctypes.windll.kernel32.OpenProcess` (vérification PID du verrou) | scripts/update_all.py:114-122 | **Non** — branche `if os.name == "nt"`, sinon `os.kill(pid, 0)` POSIX (ligne 124) |
+| `sys.stdout.reconfigure(encoding="utf-8")` | scripts/update_all.py:37-41 | Non — `try/except` |
+| Couleurs ANSI conditionnées à `sys.stdout.isatty()` | scripts/update_all.py:93 | Non — se désactivent hors TTY, ce qui est le cas en cron |
+| `update.ps1` -> `.venv\Scripts\python.exe` | update.ps1:11 | **Non** — wrapper Windows ; le Dockerfile appelle directement `python scripts/update_all.py` |
+| `install_scheduled_tasks.ps1` (Planificateur Windows) | tout le fichier | **Non** — outil de planification hôte, hors image |
+| Chemins `ROOT / "data"`, `ROOT / "logs"` | scripts/update_all.py:36-38 | Non — relatifs à `__file__`, et le Dockerfile crée `/app/data/raw` + `/app/logs` avec le bon propriétaire (Dockerfile:30-32) |
+
+**Aucun chemin absolu Windows codé en dur, aucune ressource locale au-delà de `data/` et `logs/`.** Le code a manifestement été écrit avec la portabilité en tête. La seule dépendance réellement locale est **`localhost:5432` dans le `.env`** — donnée de configuration, pas de code.
+
+---
+
+## 5. Déployabilité en Render Cron Job
+
+### Python, gestionnaire de paquets, lockfile
+
+- **Python >= 3.12** requis (pyproject.toml:5) ; image `python:3.12-slim` (Dockerfile:15).
+- **uv**, installé depuis `ghcr.io/astral-sh/uv:latest` (Dockerfile:18).
+- **Lockfile présent** : `uv.lock`, 424 lignes, utilisé avec `uv sync --frozen --no-dev --no-install-project` (Dockerfile:24) -> **build reproductible**. OK
+
+### Dépendances lourdes
+
+**Aucune.** Le manifeste (pyproject.toml:6-15) tient en 7 entrées : `sqlalchemy`, `alembic`, `psycopg2-binary`, `python-dotenv`, `httpx`, `ijson`, `tqdm`. **Ni pandas, ni numpy, ni scipy, ni scikit-learn** (vérifié par `grep` sur `uv.lock` et `pyproject.toml`).
+
+Image estimée : **~200–250 Mo** (`python:3.12-slim` ~= 130 Mo + dépendances ~= 60 Mo, dont `psycopg2-binary` qui embarque libpq). Build : **~1–2 min**, dont l'essentiel en couche cachée grâce à la copie des manifestes avant le code (Dockerfile:22-24). C'est un Dockerfile propre : multi-couches ordonnées, utilisateur non-root, pas de cron interne, entrypoint one-shot.
+
+### Tiendrait-il dans 512 Mo de RAM et un disque éphémère ?
+
+**RAM : oui, confortablement.**
+
+| Étape | Pic mesuré | Verdict |
+|---|---|---|
+| Scryfall | streaming ijson, batches de 500 | OK largement sous 512 Mo |
+| Cardmarket price guide | **108 Mo** (tracemalloc, fichier réel) | OK |
+| Cardmarket product catalog | **99 Mo** (tracemalloc, fichier réel) | OK |
+| Game Changers | négligeable | OK |
+| Tags | INCONNU | /!\ |
+
+Les étapes tournant en sous-processus séquentiels (scripts/update_all.py:246), les pics ne se cumulent pas. Marge confortable même en comptant le surcoût de l'interpréteur (RSS réel ~= 150–200 Mo au pire).
+
+**Disque : non. C'est le point de rupture.**
+
+- **2,57 Go** téléchargés par run utile, **5,1 Go de pic** (download avant purge).
+- Render Cron Jobs : système de fichiers **éphémère**, **aucun volume persistant possible**.
+- Conséquence : chaque run utile repart de zéro. Le volume `scryfall_raw` de docker-compose.yml:33 — qui existe précisément pour éviter ça — est inutilisable.
+
+Le pic de 5,1 Go ne se produirait cependant **pas** sur Render : le disque étant vierge à chaque run, il n'y a pas d'ancien bulk à côté du nouveau. Le besoin réel est donc **2,57 Go + marge**, ce qui reste au-delà de ce que Render garantit sur un cron job.
+
+### Durée d'un run vs fenêtre de cron
+
+| Scénario | Durée observée | Fenêtre |
+|---|---|---|
+| Bulk déjà importé | **0–9 s** | Trivial |
+| Run complet (localhost) | **5m12s – 18m26s** (`import_runs`) | OK |
+| Run complet sur Render (estimé) | **7–22 min** (+2–4 min de téléchargement CDN) | Acceptable |
+
+Render Cron Jobs n'impose pas de timeout court. La durée n'est pas le problème — **le disque l'est**.
+
+### Verdict
+
+**À garder sur le PC de Fabien (ou un petit VPS à disque persistant), pointant vers la base cloud.**
+
+Le raisonnement en un chiffre : un run **télécharge 2,57 Go depuis Scryfall** mais **n'écrit que ~34 Mo vers PostgreSQL** (340 569 lignes de prix x ~100 octets de payload). Le coût est **en amont**, côté lecture Internet, pas en aval côté base. Déplacer le calcul vers le cloud paie le trajet cher (2,57 Go sur disque éphémère) pour économiser un trajet gratuit (34 Mo d'upload).
+
+*Si* le déploiement Render était imposé, les adaptations chiffrées seraient :
+
+1. **Passer de `all_cards` à `default_cards`** (scripts/import_scryfall.py:70) : 2,57 Go -> ~500 Mo. **Mais** cela supprime les impressions non-anglaises et donc `printed_name` — les 521 075 lignes de `scryfall_card_printings` tomberaient à ~120 000. Fonctionnellement inacceptable si RELIC affiche les noms localisés.
+2. **Parser en flux depuis la réponse HTTP** sans passer par le disque : `ijson.items(resp.iter_bytes(), 'item')` au lieu de `download_bulk_file()` puis `import_cards()`. Supprime **100 %** de l'écriture disque, RAM inchangée (ijson reste en streaming). Coût : ~40 lignes à réécrire (scripts/import_scryfall.py:136-147 et 500-560), et perte de la reprise sans retéléchargement.
+3. **Objet S3/R2 comme cache** de bulk à la place du volume : ~20 lignes + un compte de stockage.
+
+L'option 2 est la seule vraiment propre, et elle est raisonnable (~1 journée de travail). Elle ne devient rentable que si l'autonomie vis-à-vis du PC est un objectif en soi.
+
+### Le pipeline local écrivant dans une base distante : est-ce tenable ?
+
+**Oui, très largement. La dégradation est de l'ordre de la minute, pas de l'heure.**
+
+Ce qui compte ici n'est pas le débit mais le **nombre d'allers-retours**, car les écritures sont des INSERT multi-lignes groupés, pas des INSERT unitaires :
+
+- Scryfall : 38 261 cartes / `BATCH_SIZE = 500` = **77 batches**. Chaque batch émet ~4 statements groupés (cards, faces, printings, prices) + 1 commit ~= **5 allers-retours** -> **~385 allers-retours** pour tout le run.
+- Cardmarket : 125 247 prix / `BATCH_SIZE = 2000` = **63 batches** ~= **~190 allers-retours**.
+
+Avec une latence de **40 ms** (PC français -> Neon/Render Francfort), le surcoût réseau total est de **(385 + 190) x 40 ms ~= 23 secondes**.
+
+| | localhost | base cloud (RTT 40 ms) |
+|---|---|---|
+| Run Scryfall complet | 5–18 min | **5–19 min** (+~15 s) |
+| Run Cardmarket complet | 17–38 s | **~25–46 s** (+~8 s) |
+| Upload par run | — | **~34 Mo** (Scryfall) + ~13 Mo (CM) |
+
+**~47 Mo d'upload par jour** : négligeable sur n'importe quelle connexion fixe (quelques secondes en ADSL, instantané en fibre). Le goulot d'étranglement reste **le parsing des 2,57 Go**, strictement inchangé.
+
+C'est le batching qui sauve la mise. Un pipeline en INSERT unitaires (465 816 lignes/jour x 40 ms = **5 h 10**) serait ingérable — celui-ci ne l'est pas.
+
+---
+
+## 6. Migration vers le cloud
+
+### `pg_dump` / `pg_restore` est-il réaliste ?
+
+**Oui, mais uniquement en dump sélectif.**
+
+Ne surtout pas dumper `manamind` en entier : **15 Go dont 13 Go appartiennent à ManaMind_AI**, sans rapport avec RELIC.
+
+```bash
+# Dump du seul catalogue — binaires de la version CIBLE (16/17), pas ceux de 18
+pg_dump -h localhost -U postgres -d manamind -Fc -Z6 \
+  -t 'scryfall_*' -t 'cardmarket_*' -t 'import_runs' -t 'mtgdb_alembic_version' \
+  -f catalogue.dump
+```
+
+| Métrique | Estimation |
+|---|---|
+| Périmètre | **1 862 Mo** (tables `scryfall_*` + `cardmarket_*`) |
+| Taille du dump (`-Fc -Z6`) | **~400–600 Mo** (JSON et texte se compressent bien) |
+| Durée `pg_dump` | **3–6 min** |
+| Upload vers le cloud | **~2–5 min** (fibre) |
+| Durée `pg_restore -j4` | **10–25 min** (les 500 Mo d'index du catalogue se reconstruisent) |
+| **Total** | **~20–35 min** |
+
+Parfaitement réaliste. Deux réserves :
+
+1. **Descente de version 18 -> 16/17** : utiliser les binaires `pg_dump` de la version cible. Un dump produit par `pg_dump` 18 n'est pas garanti restaurable sur un serveur 16.
+2. `pg_restore` doit tourner **avant** tout `alembic upgrade` sur la base cible, ou alors on restaure schéma + données d'un coup et on laisse `mtgdb_alembic_version` porter la tête.
+
+### Dump ou rejouer les imports ?
+
+**Recommandation : restaurer un dump.** Sans hésitation, pour une raison qui n'est pas la durée.
+
+Rejouer les imports serait tentant : ~10 min de Scryfall + 40 s de Cardmarket sur une base vierge, contre ~30 min de dump/restore. Plus rapide, plus propre, et ça valide le pipeline de bout en bout.
+
+**Mais ça détruirait l'historique des prix, définitivement.** Un import ne reconstruit que la photo **du jour** :
+
+- `scryfall_card_prices` : les 8 dates capturées (2026-06-07 -> 2026-07-16) tomberaient à **1**. 2 710 343 lignes -> ~340 000.
+- `cardmarket_price_guide_entries` : les 5 dates tomberaient à **1**. 644 318 -> ~125 000.
+
+Scryfall et Cardmarket ne publient **que le présent** — leurs bulks n'ont pas d'API rétrospective. Ces séries temporelles sont irremplaçables : une fois perdues, il faut 12 mois pour en reconstituer 12 mois.
+
+Aujourd'hui l'historique est court (5–8 photos) et sa perte serait supportable. **Cet arbitrage se referme définitivement le jour où RELIC affichera une courbe de prix.** Autant restaurer maintenant et ne plus jamais avoir à se poser la question.
+
+L'approche hybride est la meilleure des deux : **restaurer le dump, puis lancer un import à vide** pour vérifier que le pipeline attaque correctement la base cloud (il sortira en quelques secondes grâce au garde-fou `import_runs.source_file` — test parfait, coût nul).
+
+### Données non reproductibles par un import
+
+**À sauvegarder impérativement :**
+
+| Table | Lignes | Pourquoi irrécupérable |
+|---|---|---|
+| `scryfall_card_prices` (historique) | 2 710 343 | Séries temporelles — seule la date du jour est réimportable |
+| `cardmarket_price_guide_entries` (historique) | 644 318 | Idem |
+| `scryfall_card_tags` | 773 | Scrapé depuis Tagger ; le script hebdomadaire semble ne jamais avoir abouti (2 % de couverture) — ces 773 lignes sont peut-être le fruit d'un run manuel non rejouable |
+| `import_runs` | 8 | **Critique** : c'est le garde-fou d'idempotence. Sans cette table, le premier run sur la base cloud retéléchargerait et re-parserait 2,57 Go inutilement |
+| `cardmarket_import_files` | 20 | Idem pour les ETags Cardmarket |
+| `user_collection` | 4 408 | Données utilisateur — **aucun import ne les recrée** |
+| `user_deck_cards` | 1 820 | Idem |
+| `users`, `invitations`, `user_opened_sets`, `user_moxfield_decks` | 2 / 1 / 21 / 22 | Idem |
+
+/!\ Les six dernières lignes de ce tableau sont des **tables applicatives présentes dans `manamind`**, alors que RELIC possède ses propres `users` dans `MTGTrade_DB`. Voir §7 — elles ne doivent pas être oubliées dans le dump sous prétexte qu'elles ne matchent pas `scryfall_*` / `cardmarket_*`.
+
+**Reproductible sans risque** : `scryfall_cards`, `scryfall_card_faces`, `scryfall_card_printings`, `scryfall_mtg_sets`, `cardmarket_products`, flag `game_changer`.
+
+---
+
+## 7. Contradictions entre code et documentation
+
+### 7.1 — /!\ ADR-003 de RELIC : « une seule base `manamind` » — **le code dit non**
+
+**Le code de ce dépôt est sans ambiguïté : `.env` pointe vers `manamind`, et rien d'autre.** Il n'existe qu'une variable `DATABASE_URL` (src/mtgdb/db/engine.py:26), aucune notion de seconde base, aucun cross-database (impossible en PostgreSQL sans FDW, et aucun FDW n'est installé — seule extension : `plpgsql`).
+
+Mais l'état réel de l'instance donne raison… aux deux, ce qui est le vrai problème :
+
+| Base | Taille | Contenu |
+|---|---|---|
+| `manamind` | 15 GB | Catalogue MTG-DB + tables ManaMind_AI + **`users`, `user_collection`, `user_deck_cards`, `invitations`, `user_opened_sets`, `user_moxfield_decks`** + `mtgtrade_alembic_version` (vide) |
+| `MTGTrade_DB` | 8862 kB | `users`, `orders`, `sessions`, `oauth_accounts`, `card_pricing_rules`, `global_settings`, `order_counters`, `password_reset_tokens`, `mtgtrade_alembic_version` |
+
+**Il y a une table `users` dans les deux bases.** Et `manamind` contient `user_collection` (4 408 lignes) et `user_deck_cards` (1 820 lignes) — des données manifestement RELIC, avec du contenu réel, ajoutées par la migration alembic/versions/20260705_add_user_collection.py **de ce dépôt**.
+
+La lecture la plus cohérente : l'ADR-003 décrit l'**intention initiale** (tout dans `manamind`), le `.env` de RELIC décrit un **découplage opéré ensuite** (`MTGTrade_DB` pour l'applicatif), et **la migration n'a jamais été terminée**. La présence d'une `mtgtrade_alembic_version` **vide** dans `manamind` est la signature de ce basculement inachevé.
+
+**Ce n'est pas une question de documentation, c'est une question ouverte sur les données.** Avant toute migration cloud, il faut trancher : les 4 408 lignes de `user_collection` dans `manamind` sont-elles la collection vivante des utilisateurs de RELIC, ou un vestige mort de l'époque mono-base ? Migrer sans le savoir, c'est soit perdre des données utilisateur, soit en ressusciter d'obsolètes. **La réponse est chez RELIC, pas ici** — ce dépôt ne fait qu'héberger les tables.
+
+### 7.2 — `default_cards` dans la doc, `all_cards` dans le code
+
+scripts/import_scryfall.py:6 (docstring) annonce :
+> `GET https://api.scryfall.com/bulk-data -> download_uri du fichier default_cards`
+
+et le message d'erreur ligne 75 :
+> `raise ValueError("Type 'default_cards' introuvable dans l'API bulk-data Scryfall.")`
+
+Or le code teste `if item.get("type") == "all_cards"` (ligne 70).
+
+**C'est le code qui a raison** — le fichier sur disque est bien `all-cards-20260715212942.json`, et README.md:84 le confirme (« Source : bulk `all_cards` (~2,4 Go) »). Restent **deux mentions périmées** de `default_cards` dans `import_scryfall.py`. Le facteur 5 entre les deux bulks (500 Mo vs 2,57 Go) fait de cette incohérence un vrai piège pour qui dimensionne un disque en lisant la docstring.
+
+### 7.3 — « 2,4 Go » partout dans la doc, 2,57 Go en réalité
+
+Annoncé en README.md:43, README.md:84, scripts/update_all.py:17, scripts/import_scryfall.py:85, docs/deploiement.md:15-16, docs/deploiement.md:78, docker-compose.yml:31.
+
+Mesuré : **2 569 975 967 octets = 2,39 Gio = 2,57 Go**.
+
+Pas vraiment une erreur — la doc compte en gibioctets, la réalité en gigaoctets. Signalé parce qu'un disque cloud se facture en **Go décimaux** : dimensionner « 2,4 Go » donnerait un disque trop court de 7 %, avant même de compter le pic.
+
+### 7.4 — Le pic disque de 5,1 Go n'est documenté nulle part
+
+docs/deploiement.md:16 affirme :
+> *« Les anciens bulks (2,4 Go pièce) sont supprimés après import. »*
+
+C'est exact, mais **« après » est le mot qui coûte cher**. Le téléchargement (scripts/import_scryfall.py:602) précède la purge (lignes 673-675) : pendant toute la durée du parsing — **5 à 18 minutes** — l'ancien et le nouveau bulk coexistent, soit **5,1 Go**.
+
+Aucune documentation ne mentionne ce pic. Quiconque provisionne un disque de 3 Go en lisant `deploiement.md` verra le second run échouer par disque plein. Réordonner purge-puis-download supprimerait le problème (au prix de perdre le bulk précédent en cas d'échec du téléchargement).
+
+### 7.5 — Les entry points de `pyproject.toml` sont tous cassés
+
+Détaillé en §3. `mtgdb-import` et `mtgdb-game-changers` pointent vers `mtgdb.scripts.*` (module inexistant) ; les quatre autres vers `scripts.*` (répertoire non packagé, pyproject.toml:28). Le README et le Dockerfile invoquent tous les scripts **par chemin de fichier**, ce qui masque le problème. À ne pas découvrir en écrivant un `startCommand: mtgdb-import` sur Render.
+
+### 7.6 — Aucune purge des fichiers Cardmarket
+
+scripts/update_all.py:17 annonce la « purge automatique des anciens fichiers bulk », et `--keep-bulks` / `--no-purge` sont présentés comme globaux (scripts/update_all.py:210-211). En réalité `purge_old_bulks()` n'est appelé **que** depuis `import_scryfall.py`. `data/raw/cardmarket/price_guide/` et `product_catalog/` accumulent sans limite : **5 fichiers chacun, ~228 Mo aujourd'hui, +46 Mo/jour**. Lent, mais monotone.
+
+### 7.7 — [CORRIGÉ] L'étape « tags » fonctionne — c'était une erreur d'audit
+
+**Une version antérieure de ce rapport affirmait que `scryfall_card_tags` ne contenait que 773 lignes (2 % de couverture) et que l'étape n'avait jamais abouti. C'était faux.**
+
+Le chiffre de 773 venait de `pg_stat_user_tables.n_live_tup`, une **statistique périmée** faute d'`ANALYZE` récent. Le `count(*)` réel donne :
+
+| Mesure | Valeur réelle |
+|---|---|
+| Tags dans `scryfall_card_tags` | **225 963** |
+| Cartes distinctes taguées | **34 534** sur 38 261 |
+| **Couverture** | **90,3 %** |
+| Cartes restant à traiter | **2 610** |
+
+L'étape tags fonctionne normalement. Les 2 610 cartes restantes sont refetchées à chaque run hebdomadaire (~22 min à 0,5 s/carte), ce qui **corrobore le « ~40 min » annoncé par la doc** (scripts/update_all.py:39) que ce rapport présentait à tort comme infondé.
+
+Comportement à connaître, sans être un défaut : une carte qui n'a légitimement aucun tag chez Tagger renvoie `[]`, et `upsert_tags()` sort alors sans rien écrire (scripts/import_tagger_tags.py:204-205). Elle reste donc éligible au filtre `only_missing` et sera réinterrogée à chaque run. C'est le plancher incompressible des 2 610 cartes. Le corriger supposerait une table de « cartes vues sans tag » — coût supérieur au gain de ~22 min hebdomadaires.
+
+**Fiabilité des autres chiffres de ce rapport** : `count(*)` réel vs `n_live_tup` a été comparé sur les 10 tables principales. Seule `scryfall_card_tags` était significativement fausse (−99,7 %). Toutes les autres sont à moins de 0,3 % près (`scryfall_card_prices` 2 713 742 réels vs 2 710 343 estimés ; `deck_cards` 36 229 697 vs 36 330 581 ; `cardmarket_price_guide_entries` 644 318 — issu d'un `count(*)` dès l'origine). **Les projections de volumétrie et les octets/ligne du §1 reposent sur des `count(*)` réels et restent valides.**
+
+Leçon applicable au-delà de ce cas : sur une base sans autovacuum récemment passé, `n_live_tup` peut mentir d'un facteur 300. Les colonnes « lignes estimées » du §1 sont indicatives ; les tailles (`pg_total_relation_size`) sont, elles, toujours exactes.
+
+### 7.8 — PostgreSQL 18 en local, 16/17 dans le cloud
+
+L'énoncé de cet audit suppose PostgreSQL 16. Le serveur tourne en **18.4**. Sans impact sur le schéma (§2), mais avec deux conséquences opérationnelles : utiliser les binaires `pg_dump` de la version **cible**, et accepter que la prod tourne sur une version **antérieure** au développement — configuration inhabituelle, où un comportement validé en local peut ne pas exister en prod. Aucun cas concret identifié ici.
+
+---
+
+## Réponses aux 2 décisions
+
+### Décision 1 — Volumétrie -> hébergeur
+
+| Métrique | Valeur mesurée |
+|---|---|
+| Base `manamind` (totale) | **15 Go** |
+| **Catalogue réel** (`scryfall_*` + `cardmarket_*`) | **1 862 Mo ~= 1,82 Go** |
+| Dont ManaMind_AI (hors périmètre) | **~13 Go** (`deck_cards` = 12 Go à elle seule) |
+| Base `MTGTrade_DB` | **8,7 Mo** |
+| **Croissance mensuelle** | **~4,1 Go/mois** (135 Mo/jour) |
+| **Projection à 12 mois** | **~51 Go** |
+| Purge de l'historique | **Aucune** |
+
+**Le chiffre qui décide : 135 Mo/jour, dont 0 octet purgé.**
+
+Décomposition : `scryfall_card_prices` 340 569 lignes/jour x 181 o = 61,6 Mo/jour, plus `cardmarket_price_guide_entries` 125 247 lignes/jour x 587 o = 73,5 Mo/jour. Les deux tables sont append-only par conception, sans rétention.
+
+**La vraie décision n'est pas Neon vs Render — c'est « purge-t-on l'historique ? ».** Elle change le problème d'un ordre de grandeur :
+
+| Politique | Taille à 12 mois | Nature du problème |
+|---|---|---|
+| **Aucune purge** (aujourd'hui) | **~51 Go** | Cher chez tout le monde ; hors des plans d'entrée partout |
+| **Rétention 90 jours** | **~14 Go** | Confortable, un plan standard suffit |
+| **Rétention 30 jours** | **~6 Go** | Trivial |
+
+Une rétention à 90 jours divise la facture par 3,6. Et elle est **probablement gratuite fonctionnellement** : la seule vue exposée s'appelle `v_cardmarket_latest_prices_by_printing` — RELIC ne semble lire que **la dernière photo**. À confirmer côté RELIC, mais si c'est le cas, un `DELETE ... WHERE captured_at < now() - interval '90 days'` mensuel règle la question.
+
+**DÉCISION PRISE (16 juillet 2026) : aucune rétention.** L'historique complet de prix est conservé — il a de la valeur (courbes de prix côté RELIC) et sa perte serait définitive, aucune API ne rejouant le passé. La trajectoire des **~51 Go à 12 mois est donc assumée**, et c'est elle qui commande l'hébergeur.
+
+**Recommandation, à la lumière de cette décision :**
+
+1. **Ni Neon ni Render ne conviennent à 51 Go.** La question posée au départ (« Neon vs Render ») avait pour hypothèse implicite une base de quelques Go. À 51 Go, les deux sortent de leurs plans d'entrée et deviennent coûteux ; Render impose en outre de provisionner à l'avance un disque **qu'on ne pourra pas réduire ensuite**. Le scale-to-zero de Neon, pertinent pour une petite base en lecture intermittente, ne compense pas 51 Go facturés au stockage.
+2. **Regarder un VPS à disque** (Hetzner, Scaleway, OVH) avec PostgreSQL auto-hébergé. À cette volumétrie, un VPS 4 Go de RAM / 80 Go de disque coûte typiquement moins qu'un plan managé à 51 Go, et lève au passage la contrainte du §« décision 2 » : **le même VPS peut héberger la base ET les imports**, avec un disque persistant pour le bulk de 2,6 Go et le `docker-compose.yml` déjà écrit. C'est la seule option qui résout les deux décisions d'un coup.
+3. **Contrepartie honnête** : un VPS, ce sont les sauvegardes, les mises à jour et la supervision à sa charge — ce qu'un service managé fournit. À arbitrer selon l'appétence pour l'administration système. Si le managé est non négociable, alors la décision 1 rouvre nécessairement la question de la rétention.
+4. **Ne migrer que 1,82 Go, pas 15.** Le dump doit être sélectif (voir §6) — mais sans oublier les tables `user_*` (§7.1), dont le sort doit être tranché avec RELIC au préalable.
+5. **Vérifier la chaîne de connexion au premier essai** : `psycopg2` + `sslmode=require` de Neon, et le préfixe `postgres://` que Render fournit encore et que `psycopg2` refuse. Aucune normalisation n'existe dans le code (src/mtgdb/db/engine.py:29). Sans objet sur un VPS auto-hébergé.
+6. **Surveiller la trajectoire.** 135 Mo/jour est une mesure sur 5 jours d'imports Cardmarket et 8 de Scryfall. Revérifier `pg_database_size` dans 3 mois : si la pente se confirme, la décision « VPS » est validée ; si RELIC finit par n'exploiter que la dernière photo, la rétention redevient le levier le moins cher (51 Go -> 14 Go) et le managé redevient jouable.
+
+### Décision 2 — Où faire tourner les imports
+
+**Recommandation : garder les imports sur le PC de Fabien (ou un petit VPS avec disque persistant), pointant vers la base cloud via `DATABASE_URL`.**
+
+**Le chiffre qui justifie : un run télécharge 2,57 Go depuis Scryfall mais n'écrit que ~34 Mo vers PostgreSQL — un rapport de 75 pour 1.**
+
+Tout le coût est côté **lecture Internet**, aucun côté **écriture base**. Render inverserait exactement le mauvais levier : payer un disque éphémère de 2,57 Go par run pour économiser 34 Mo d'upload quotidien qui ne coûtent rien.
+
+**Ce qui rend le local viable — le surcoût réseau est de ~23 secondes :**
+
+Les écritures sont groupées, pas unitaires : 77 batches Scryfall (`BATCH_SIZE = 500`) + 63 batches Cardmarket (`BATCH_SIZE = 2000`), soit **~575 allers-retours** au total. À 40 ms de latence (France -> Francfort) : **~23 s** ajoutées à un run de 5–18 min. Un run passe de 5m12s à ~5m35s. **Aucune dégradation significative.**
+
+Pour mesurer ce qu'on évite : un pipeline en INSERT unitaires (465 816 lignes/jour x 40 ms) prendrait **5 h 10 par run**. Le batching est ce qui rend cette décision possible — c'est un bon point de conception de ce dépôt.
+
+**Ce qui exclut Render Cron Jobs :**
+
+| Contrainte | Mesure | Verdict |
+|---|---|---|
+| RAM 512 Mo | pics de **108 Mo** / **99 Mo** (tracemalloc) ; Scryfall en streaming ijson | OK passe largement |
+| Durée | **5m12s – 18m26s** (`import_runs`) | OK acceptable |
+| Image / build | ~200–250 Mo, `uv sync --frozen`, aucune dépendance lourde | OK excellent |
+| **Disque éphémère** | **2,57 Go par run utile**, retéléchargés chaque jour | NON **rédhibitoire** |
+
+Le volume `scryfall_raw` de docker-compose.yml:33 existe littéralement pour éviter ce retéléchargement — son propre commentaire le dit. Render Cron Jobs ne propose pas de volume persistant.
+
+Nuance honnête en faveur de Render : le garde-fou d'idempotence lit `import_runs` **en base** et sort **avant** le téléchargement (scripts/import_scryfall.py:78-95). Les runs à vide coûtent donc 0 Go même sans disque. Le problème ne se pose que sur les runs **utiles** — un par jour, tous les jours.
+
+**Réponse directe à l'inquiétude de l'énoncé** — « si les imports restent sur le PC alors que la prod lit une base cloud, les prix ne seront jamais actualisés » : **ce risque n'existe pas.** Il suffit de changer `DATABASE_URL` dans le `.env` local pour pointer vers le cloud. Le pipeline écrit alors dans la base de production, depuis le PC, avec ~23 s de surcoût. La seule dépendance est **la disponibilité du PC** : s'il est éteint à 08:00 et 20:00, la photo du jour est perdue — définitivement, puisqu'aucune API ne rejoue le passé.
+
+**Feuille de route :**
+
+1. **Immédiat, coût nul** : changer `DATABASE_URL` vers la base cloud, garder le Planificateur Windows. Ça marche dès aujourd'hui. Surveiller `import_runs.status` et la fraîcheur de `max(captured_at)` pour détecter un PC resté éteint.
+2. **Quand la dépendance au PC deviendra gênante** : basculer sur un **VPS à ~5 EUR/mois avec 20 Go de disque** et le `docker-compose.yml` **déjà écrit** — image one-shot, pas de cron interne, volume persistant, `DATABASE_URL` injecté. C'est prêt, il n'y a rien à développer. **C'est la vraie cible**, et elle coûte moins cher qu'un jour de dev.
+3. **Uniquement si Render est imposé** : réécrire `import_scryfall.py` pour parser en flux depuis la réponse HTTP (`ijson.items(resp.iter_bytes(), 'item')`), supprimant 100 % de l'écriture disque à RAM constante. ~40 lignes (scripts/import_scryfall.py:136-147 et 500-560), ~1 journée. Coût : perte de la reprise sans retéléchargement.
+
+**Correctifs — état au 16 juillet 2026** (après traitement) :
+
+| # | Correctif | Fichier | État |
+|---|---|---|---|
+| 1 | Rétention sur les tables de prix | — | **ÉCARTÉ — décision assumée.** L'historique complet est conservé (valeur : courbes de prix RELIC). Conséquence acceptée : **~51 Go à 12 mois**, ce qui oriente vers un VPS à disque plutôt que Neon/Render. Voir décision 1. |
+| 2 | Purge des fichiers Cardmarket | scripts/import_cardmarket_all.py, import_cardmarket_price_guide.py, import_cardmarket_products.py | **FAIT** — `purge_old_files(keep=2)` après chaque import. Libère ~180 Mo, supprime la croissance de +46 Mo/jour. |
+| 3 | Purge **avant** téléchargement | scripts/import_scryfall.py | **FAIT** — pic disque **5,1 Go -> 2,6 Go**. A nécessité de réserver `current` dans le budget `keep` même absent du disque : déplacer l'appel seul n'aurait rien gagné (avec keep=1, l'ancien bulk aurait survécu). Gardé hors `--dry-run`. |
+| 4 | Entry points cassés | pyproject.toml | **FAIT — supprimés**, pas réparés. Les scripts reposent sur `sys.path.insert(ROOT/"src")` et sont conçus pour tourner depuis le dépôt ; les rendre installables imposerait de déplacer `scripts/` dans `src/mtgdb/` (Dockerfile, update_all.py, planificateur, doc) pour zéro gain — tout invoque déjà par chemin. |
+| 5 | `default_cards` -> `all_cards` | scripts/import_scryfall.py:6,75 | **FAIT** — les 2 mentions périmées corrigées. |
+| 6 | Uniformiser le chargement de `.env` | src/mtgdb/db/engine.py | **RETIRÉ — mauvaise recommandation.** La remontée depuis le cwd est **voulue** : le docstring dit « racine du projet consommateur » et c'est ce qui permet à l'API de RELIC d'importer `mtgdb.db.engine` et de trouver *son* `.env`. La « durcir » casserait les deux projets consommateurs. Le risque réel (lancer un import depuis le mauvais cwd) doit se traiter côté scripts, pas côté bibliothèque. |
+| 7 | Diagnostiquer l'étape « tags » | scripts/import_tagger_tags.py | **FAIT — faux positif.** Couverture réelle **90,3 %**, pas 2 %. Aucun correctif nécessaire. Voir §7.7. |
+
+Nouveau module introduit : **src/mtgdb/rawfiles.py** — `purge_old_files()`, implémentation unique partagée par les pipelines Scryfall et Cardmarket (évite la duplication qu'aurait créée le #2). Testé sur 6 scénarios (purge avant/après téléchargement, current absent/partiel/présent, keep=1/2, répertoire inexistant).
+
+---
+
+## INCONNU
+
+Ce que je n'ai pas pu déterminer, et pourquoi :
+
+| Point | Pourquoi |
+|---|---|
+| **Pic RAM exact de l'import Scryfall** | Non mesuré — le mesurer imposait de lancer un import complet (écriture en base, interdite par le périmètre lecture seule). Structurellement borné : `ijson` streame et `BATCH_SIZE = 500` plafonne les buffers. Certainement < 512 Mo, mais le chiffre exact manque. |
+| **Durée mesurée de l'étape « tags »** | RÉSOLU pour la couverture (90,3 %, voir §7.7), mais la **durée** reste déduite (~22 min) et non chronométrée : aucun run `--only tags` dans les logs conservés, et `import_tagger_tags.py` n'écrit pas dans `import_runs`. |
+| **Rate-limit et CGU des exports S3 Cardmarket** | Aucun appel réseau engagé dans cet audit. Les fichiers sont publics et non authentifiés, mais les conditions d'usage applicables à `downloads.s3.cardmarket.com` ne se déduisent pas du code. **À vérifier avant un usage commercial** — RELIC étant un projet marchand, ce point n'est pas cosmétique. |
+| **Latence réelle PC -> hébergeur cloud** | Les 40 ms utilisés sont une hypothèse (France -> Francfort). Dépend de la connexion de Fabien et de la région retenue. Le calcul reste valable jusqu'à ~150 ms (surcoût ~86 s), donc la conclusion ne bascule pas. |
+| **Profondeur d'historique de prix consommée par RELIC** | Question centrale de la décision 1 (51 Go vs 14 Go). La vue `v_cardmarket_latest_prices_by_printing` suggère « la dernière photo seulement », mais seul le code de RELIC peut le confirmer. **Hors de ce dépôt.** |
+| **Statut des tables `user_*` dans `manamind`** | `user_collection` (4 408 lignes) et `user_deck_cards` (1 820 lignes) sont-elles vivantes ou vestigiales, alors que RELIC a ses propres `users` dans `MTGTrade_DB` ? Voir §7.1. **La réponse est chez RELIC.** Bloquant avant migration. |
+| **Compatibilité de la chaîne de connexion Neon/Render** | `psycopg2` refuse le préfixe `postgres://` ; Neon impose `sslmode=require`. Aucune normalisation dans src/mtgdb/db/engine.py:29. Non testable sans compte cloud. |
+| **Contenu de l'ADR-003 de RELIC** | Cité de seconde main dans l'énoncé. Je n'ai pas eu accès au dépôt RELIC — l'analyse de §7.1 repose sur l'état de l'instance PostgreSQL et le code de MTG-DB uniquement. |
+| **Taille du dump compressé** | Estimation (~400–600 Mo) fondée sur des ratios usuels pour du JSON/texte. Un `pg_dump` réel n'a pas été lancé (lecture seule, mais 3–6 min de charge sur la base de Fabien — jugé hors périmètre d'un audit passif). |
+
+---
+
+**Méthode** : requêtes SQL exécutées via `psycopg2` en `SET SESSION READ ONLY` contre `localhost:5432`, bases `manamind` et `MTGTrade_DB`. Mesures de RAM par `tracemalloc` sur les fichiers JSON réels déjà présents dans `data/raw/`, sans accès base. Durées extraites de la table `import_runs` et des 9 fichiers `logs/update_*.log`. Aucun fichier du dépôt modifié ; les scripts de mesure ont été écrits dans le répertoire scratchpad de session. Aucun secret reproduit.

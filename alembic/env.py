@@ -31,6 +31,37 @@ database_url = os.getenv("DATABASE_URL")
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 
+# La base `manamind` est PARTAGÉE avec d'autres projets (ManaMind_AI, mtgtrade), qui y
+# appliquent leurs propres migrations. Deux précautions en découlent :
+#
+# 1. VERSION_TABLE : chaque projet a besoin de sa propre table de version, sinon les
+#    historiques se piétinent (ManaMind_AI utilise `alembic_version`, mtgtrade utilise
+#    `mtgtrade_alembic_version`). MTG-DB a la sienne.
+#
+# 2. INCLUDE_OBJECT : sans ce filtre, l'autogenerate verrait les tables des autres
+#    projets (users, deck_cards, card_neighbors…), les croirait supprimées puisqu'elles
+#    ne sont pas dans nos modèles, et générerait des op.drop_table() dessus.
+VERSION_TABLE = "mtgdb_alembic_version"
+
+# Tables dont ManaMind_AI est propriétaire, bien que MTG-DB en expose des modèles pour
+# les lire. Ses migrations y ajoutent des colonnes (tfidf, idf, tfidf_norm) que nos
+# modèles ignorent : sans cette exclusion, l'autogenerate proposerait de les supprimer.
+# Les modèles restent utilisables en lecture — ils sortent seulement du périmètre des
+# migrations de ce dépôt.
+FOREIGN_TABLES = {"deck_stat_global", "deck_stat_commander"}
+
+
+def include_object(object, name, type_, reflected, compare_to):
+    """N'expose à l'autogenerate que les tables dont MTG-DB est réellement propriétaire."""
+    if type_ == "table":
+        if name in FOREIGN_TABLES:
+            return False
+        # Table présente en base mais absente de nos modèles → appartient à un autre
+        # projet (users, deck_cards, card_neighbors…). Ne pas proposer de la supprimer.
+        if reflected and name not in target_metadata.tables:
+            return False
+    return True
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
@@ -41,6 +72,8 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         compare_server_default=True,
+        version_table=VERSION_TABLE,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -58,6 +91,8 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             compare_type=True,
             compare_server_default=True,
+            version_table=VERSION_TABLE,
+            include_object=include_object,
         )
         with context.begin_transaction():
             context.run_migrations()

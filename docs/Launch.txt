@@ -1,4 +1,57 @@
-cd "c:\Users\fabie\Documents\GitHub\MTG-DB"
+================================================================================
+COMMANDES DE LANCEMENT — MTG-DB
+================================================================================
 
-$env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python scripts/import_tagger_tags.py
+MISE À JOUR COMPLÈTE (recommandé)
+─────────────────────────────────
+Enchaîne les 4 sources : Scryfall → Cardmarket → Game Changers → Tags Tagger.
 
+    cd "c:\Users\fabie\Documents\GitHub\MTG-DB"
+    .\update.ps1
+
+Options utiles :
+    .\update.ps1 --dry-run              # affiche le plan sans rien exécuter
+    .\update.ps1 --only cardmarket      # une seule source
+    .\update.ps1 --skip tags            # tout sauf les tags Tagger (~7 min)
+    .\update.ps1 --force                # réimporte le bulk Scryfall
+    .\update.ps1 --tags-all             # retraite TOUS les tags (long)
+    .\update.ps1 --stop-on-error        # arrête à la première erreur
+
+Étapes disponibles pour --only / --skip :
+    scryfall | cardmarket | game-changers | tags
+
+Codes de sortie : 0 = succès | 1 = une étape a échoué | 2 = run déjà en cours
+Journal du run  : logs\update_<horodatage>.log
+
+
+MISE À JOUR AUTOMATIQUE (tâches planifiées Windows)
+───────────────────────────────────────────────────
+    .\scripts\install_scheduled_tasks.ps1          # installer
+    .\scripts\install_scheduled_tasks.ps1 -Remove  # désinstaller
+
+Crée deux tâches :
+    MTG-DB Update   08:00 et 20:00 chaque jour   (--skip tags, ~7 min)
+    MTG-DB Tags     dimanche 03:00                (--only tags, ~40 min)
+
+    Get-ScheduledTask -TaskName 'MTG-DB*'              # vérifier
+    Start-ScheduledTask -TaskName 'MTG-DB Update'      # lancer maintenant
+    Get-ScheduledTaskInfo -TaskName 'MTG-DB Update'    # dernier résultat
+
+
+PRODUCTION (Docker)
+───────────────────
+    docker compose run --rm updater --skip tags
+    docker compose run --rm updater --only tags
+
+Voir docs/deploiement.md pour le cron, la supervision et les secrets.
+
+
+LANCEMENTS INDIVIDUELS (si besoin d'une seule étape)
+────────────────────────────────────────────────────
+    $env:PYTHONIOENCODING="utf-8"
+    .\.venv\Scripts\python scripts/import_scryfall.py
+    .\.venv\Scripts\python scripts/import_cardmarket_all.py
+    .\.venv\Scripts\python scripts/import_game_changers.py
+    .\.venv\Scripts\python scripts/import_tagger_tags.py
+
+================================================================================

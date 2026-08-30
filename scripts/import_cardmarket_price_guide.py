@@ -15,6 +15,7 @@ from mtgdb.cardmarket import PRICE_GUIDE_URL
 from mtgdb.cardmarket.download import download_file
 from mtgdb.cardmarket.import_price_guide import import_price_guide
 from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.rawfiles import purge_old_files
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,7 @@ logging.basicConfig(
 log = logging.getLogger("import_cardmarket_price_guide")
 
 RAW_DIR = ROOT / "data" / "raw" / "cardmarket" / "price_guide"
+KEEP_DOWNLOADS = 2
 
 
 def main() -> None:
@@ -41,11 +43,13 @@ def main() -> None:
 
             if file_path is None:
                 log.info("Fichier non modifié — import ignoré.")
+                purge_old_files(RAW_DIR, keep=KEEP_DOWNLOADS, logger=log)
                 return
 
             log.info("Import en base…")
             n = import_price_guide(file_path, session, import_row)
             log.info(f"Terminé — {n:,} entrées importées.")
+            purge_old_files(RAW_DIR, keep=KEEP_DOWNLOADS, current=file_path.name, logger=log)
 
 
 if __name__ == "__main__":

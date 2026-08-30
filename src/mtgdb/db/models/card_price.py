@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import Date, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.sql import func
 
 from mtgdb.db.base import Base
 
@@ -38,7 +39,9 @@ class CardPrice(Base):
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     price_type: Mapped[str] = mapped_column(String(20), nullable=False)
     price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
-    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    date: Mapped[date] = mapped_column(
+        Date, nullable=False, index=True, server_default=func.current_date()
+    )
 
     printing: Mapped["CardPrinting"] = relationship("CardPrinting", back_populates="prices")
 
