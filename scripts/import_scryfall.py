@@ -21,6 +21,7 @@ import argparse
 import gzip
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime, timezone
 
@@ -51,6 +52,29 @@ SETS_URL = "https://api.scryfall.com/sets"
 RAW_DIR = ROOT / "data" / "raw" / "scryfall"
 BATCH_SIZE = 500
 HTTP_HEADERS = {"User-Agent": "MTG-DB/1.0 (educational project)"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SKIP_SCRYFALL_PRICES : ne pas alimenter scryfall_card_prices.
+#
+# À activer sur les bases où PERSONNE ne lit cette table — la production
+# RELIC-Trade, typiquement. Elle y représente 61,6 Mo/jour, soit 46 % de la
+# croissance, pour des lignes que rien ne consulte.
+#
+# À laisser DÉSACTIVÉE en local : ManaMind_AI lit bien cette table
+# (routers/collection.py, join sur CardPrice pour un MIN(price) en euros).
+# La couper en local casserait son affichage de prix.
+#
+# Pourquoi une variable d'environnement et non une détection d'URL : un
+# basculement automatique sur la forme de DATABASE_URL est un piège. L'URL de
+# l'hébergeur change, ou quelqu'un pointe le local vers le cloud pour un test,
+# et le comportement bascule sans que personne ne l'ait demandé. Une variable
+# explicite se lit dans la config et se cherche au grep.
+#
+# ⚠️ Ne supprime RIEN : les lignes déjà présentes restent. On cesse d'écrire,
+# on ne nettoie pas.
+SKIP_SCRYFALL_PRICES = os.getenv("SKIP_SCRYFALL_PRICES", "").strip().lower() in (
+    "1", "true", "yes", "on"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -489,12 +513,13 @@ def _flush_batch(
 
     scryfall_to_printing_id = _upsert_printings(session, printing_rows)
 
-    price_rows: list[dict] = []
-    for scryfall_id, prices_dict in raw_prices.items():
-        pid = scryfall_to_printing_id.get(scryfall_id)
-        if pid is not None:
-            price_rows.extend(_parse_price_rows(prices_dict, pid, today))
-    _insert_prices(session, price_rows)
+    if not SKIP_SCRYFALL_PRICES:
+        price_rows: list[dict] = []
+        for scryfall_id, prices_dict in raw_prices.items():
+            pid = scryfall_to_printing_id.get(scryfall_id)
+            if pid is not None:
+                price_rows.extend(_parse_price_rows(prices_dict, pid, today))
+        _insert_prices(session, price_rows)
 
     session.commit()
     return len(card_rows), len(printing_rows)
@@ -510,6 +535,14 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
 
     file_size_mb = file_path.stat().st_size / 1_048_576
     log.info(f"Fichier : {file_path.name} ({file_size_mb:.0f} Mo)")
+
+    # Tracé à CHAQUE run, dans les deux sens : sans cette ligne, quelqu'un qui
+    # découvre scryfall_card_prices vide conclurait à une panne d'import et
+    # « réparerait » un pipeline qui fonctionne comme prévu.
+    if SKIP_SCRYFALL_PRICES:
+        log.warning("scryfall_card_prices : écriture DÉSACTIVÉE (SKIP_SCRYFALL_PRICES=1)")
+    else:
+        log.info("scryfall_card_prices : écriture activée")
 
     for raw_card in _iter_bulk_cards(file_path):
         try:
