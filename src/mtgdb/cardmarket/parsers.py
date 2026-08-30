@@ -29,6 +29,12 @@ def parse_product(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
     return {
         "id_product": id_product,
         "id_metaproduct": _int_or_none(_get(raw, "idMetaproduct", "id_metaproduct")),
+        # Seul champ du Product Catalog qui distingue deux produits portant le même
+        # nom : `expansion_name` n'est pas fourni par Cardmarket dans ce fichier, et
+        # `en_name` est identique d'une édition à l'autre. Sans `id_expansion`, deux
+        # « Jace Reawakened » — l'un de l'édition normale, l'autre d'un promo coté
+        # 20× plus cher — sont indiscernables en SQL.
+        "id_expansion": _int_or_none(_get(raw, "idExpansion", "id_expansion")),
         "count_reprints": _int_or_none(_get(raw, "countReprints", "count_reprints")),
         "en_name": str(_get(raw, "enName", "en_name", "name", default="")),
         "website": _str_or_none(_get(raw, "website")),
