@@ -1,5 +1,6 @@
 # Environnement
 .env
+.env.prod
 .venv/
 venv/
 __pycache__/
@@ -13,6 +14,10 @@ build/
 
 # Données brutes (trop volumineuses pour git)
 data/raw/
+
+# Journaux des runs + verrou anti-chevauchement
+logs/
+data/.update_all.lock
 
 # IDE
 .vscode/
