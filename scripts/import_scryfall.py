@@ -496,6 +496,24 @@ def _replace_faces(session: Session, face_rows: list[dict], card_ids: list[int])
         session.execute(pg_insert(CardFace).values(face_rows))
 
 
+# Colonnes que le bulk Scryfall ne renseigne que pour UNE PARTIE des impressions,
+# et dont une valeur absente ne signifie donc pas « cette valeur a disparu ».
+#
+# cardmarket_id : Scryfall ne le fournit que sur l'impression anglaise. Écrasé
+# tel quel, il repassait à NULL sur les 401 230 impressions non anglaises À
+# CHAQUE RUN — que `propagate_cardmarket_ids()` repeuplait juste après, en
+# recopiant la valeur depuis l'impression anglaise de la même carte. Soit 77 %
+# de la table réécrite deux fois par run pour revenir au point de départ :
+# 24 minutes sur la base de production, mesurées le 19/09.
+#
+# Conséquence assumée : un cardmarket_id ne peut plus être EFFACÉ par le bulk.
+# Si Scryfall retire l'identifiant d'un produit délisté, l'ancienne valeur
+# subsiste. C'était déjà largement le cas — la propagation la recopiait depuis
+# une impression voisine — et le rapport de liaison Cardmarket surveille cet
+# écart (« Sans correspondance CM », 10 lignes au 19/09).
+PRESERVE_IF_NULL = frozenset({"cardmarket_id"})
+
+
 def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
     update_cols = [
         "oracle_id", "card_id", "set_code", "collector_number", "lang",
@@ -507,7 +525,14 @@ def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
     stmt = pg_insert(CardPrinting).values(rows)
     stmt = stmt.on_conflict_do_update(
         index_elements=["scryfall_id"],
-        set_={col: getattr(stmt.excluded, col) for col in update_cols},
+        set_={
+            col: (
+                func.coalesce(getattr(stmt.excluded, col), getattr(CardPrinting, col))
+                if col in PRESERVE_IF_NULL
+                else getattr(stmt.excluded, col)
+            )
+            for col in update_cols
+        },
     )
     session.execute(stmt)
     scryfall_ids = [r["scryfall_id"] for r in rows]

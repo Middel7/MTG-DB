@@ -96,6 +96,7 @@ Décomposition du run du 19/09 :
 | Téléchargement du bulk (393 Mo) | 3 s | 3 s |
 | Upsert de 520 463 impressions (1 041 batches) | 84 min | 6 min 30 |
 | `UPDATE` propagation `cardmarket_id` — **une seule requête SQL** | **24 min** | 68 s |
+| *(depuis le correctif `PRESERVE_IF_NULL`, cette propagation ne trouve plus rien à faire : 0 ligne, 1 s en local)* | | |
 | `UPDATE` propagation `tcgplayer_id_en` — une seule requête | 2 min 37 | 8 s |
 
 Les deux `UPDATE` de propagation s'exécutent **intégralement côté serveur**, en
