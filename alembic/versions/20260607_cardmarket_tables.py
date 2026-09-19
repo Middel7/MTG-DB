@@ -5,8 +5,8 @@ Revises: a1b2c3d4e5f6
 Create Date: 2026-06-07
 """
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB
 from alembic import op
+from sqlalchemy.dialects.postgresql import JSONB
 
 revision = "20260607_cardmarket_tables"
 down_revision = "a1b2c3d4e5f6"

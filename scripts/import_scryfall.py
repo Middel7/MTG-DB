@@ -24,7 +24,6 @@ import logging
 import os
 import sys
 from datetime import date, datetime, timezone
-
 from pathlib import Path
 from typing import Any
 
@@ -39,14 +38,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.db.engine import SessionLocal, check_connection, engine
-from mtgdb.db.retry import retry_transient
-from mtgdb.rawfiles import purge_old_files
 from mtgdb.db.models.card import Card, normalize_card_name
 from mtgdb.db.models.card_face import CardFace
 from mtgdb.db.models.card_price import CardPrice
 from mtgdb.db.models.card_printing import CardPrinting
 from mtgdb.db.models.import_run import ImportRun
 from mtgdb.db.models.mtg_set import MtgSet
+from mtgdb.db.retry import retry_transient
+from mtgdb.rawfiles import purge_old_files
 
 BULK_DATA_URL = "https://api.scryfall.com/bulk-data"
 SETS_URL = "https://api.scryfall.com/sets"
@@ -263,17 +262,42 @@ def bulk_already_imported(session: Session, download_uri: str) -> bool:
 
 
 def download_bulk_file(client: httpx.Client, url: str, dest: Path) -> None:
+    """
+    Télécharge le bulk, en ne publiant `dest` que si le transfert est complet.
+
+    Le fichier était écrit directement sous son nom définitif. Une coupure en
+    cours de route laissait donc un `.jsonl.gz` tronqué que le run suivant
+    considérait comme valide — `main()` se contente de `dest.exists()` pour
+    décider de ne pas retélécharger. `gzip` finissait par lever, mais des minutes
+    plus tard et sur un message qui ne désignait pas la vraie cause.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
+    partiel = dest.with_suffix(dest.suffix + ".part")
     with client.stream("GET", url, follow_redirects=True) as resp:
         resp.raise_for_status()
         total = int(resp.headers.get("content-length", 0)) or None
-        with (
-            open(dest, "wb") as f,
-            tqdm(total=total, unit="B", unit_scale=True, desc=dest.name) as bar,
-        ):
-            for chunk in resp.iter_bytes(chunk_size=65_536):
-                f.write(chunk)
-                bar.update(len(chunk))
+        recus = 0
+        try:
+            with (
+                open(partiel, "wb") as f,
+                tqdm(total=total, unit="B", unit_scale=True, desc=dest.name) as bar,
+            ):
+                for chunk in resp.iter_bytes(chunk_size=65_536):
+                    f.write(chunk)
+                    recus += len(chunk)
+                    bar.update(len(chunk))
+        except BaseException:
+            # BaseException : un Ctrl-C ou un SIGTERM doit lui aussi emporter le
+            # fichier partiel, sinon il survit au run qu'il a fait échouer.
+            partiel.unlink(missing_ok=True)
+            raise
+
+    if total and recus != total:
+        partiel.unlink(missing_ok=True)
+        raise OSError(
+            f"Téléchargement incomplet : {recus:,} octets reçus sur {total:,} annoncés.")
+
+    partiel.replace(dest)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -429,7 +453,8 @@ def _parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
 
 
 
-def _parse_price_rows(prices: dict[str, Any], printing_id: int, today: date) -> list[dict[str, Any]]:
+def _parse_price_rows(prices: dict[str, Any], printing_id: int,
+                      today: date) -> list[dict[str, Any]]:
     rows = []
     candidates = [
         ("eur", "regular", prices.get("eur")),
@@ -687,7 +712,10 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
     else:
         log.info("scryfall_card_prices : écriture activée")
 
+    lignes_lues = 0
+    lots = 0
     for raw_card in _iter_bulk_cards(file_path):
+        lignes_lues += 1
         try:
             card_row = _parse_card_row(raw_card)
             if card_row is None:
@@ -700,10 +728,16 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
             continue
 
         if len(card_rows_buf) >= BATCH_SIZE:
+            lots += 1
             lot_cartes, lot_bruts = card_rows_buf, raw_cards_buf
             try:
                 c, p = retry_transient(
-                    lambda: _flush_batch(session, lot_cartes, lot_bruts, today),
+                    # noqa B023 : `retry_transient` appelle cette lambda tout de
+                    # suite, dans l'itération courante. Les deux variables ne sont
+                    # réaffectées qu'au tour suivant, une fois l'appel terminé —
+                    # la capture tardive que la règle signale ne peut pas se
+                    # produire ici.
+                    lambda: _flush_batch(session, lot_cartes, lot_bruts, today),  # noqa: B023
                     description=f"[BATCH] cartes {cards_imported}–{cards_imported + BATCH_SIZE}",
                     on_retry=lambda: _safe_rollback(session),
                 )
@@ -717,10 +751,18 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
                 card_rows_buf = []
                 raw_cards_buf = []
 
-            if cards_imported > 0 and cards_imported % 2_000 == 0:
+            # Progression comptée en LOTS, pas en cartes. Le seuil précédent
+            # (`cards_imported % 2_000 == 0`) supposait que le compteur avançait
+            # par pas de 500 ; il avance en réalité du nombre de cartes distinctes
+            # du lot, une valeur variable. Tomber pile sur un multiple de 2 000
+            # relevait donc du hasard : mesuré sur 29 journaux consécutifs, cette
+            # ligne s'affichait 0 ou 1 fois par run. Un import de deux heures en
+            # production était muet entre son début et sa fin.
+            if lots % 40 == 0:  # ~20 000 lignes de bulk
                 log.info(
-                    f"  -> {cards_imported:>6,} cartes  |  "
-                    f"{printings_imported:>6,} impressions  |  "
+                    f"  -> {lignes_lues:>7,} lignes lues  |  "
+                    f"{cards_imported:>7,} cartes  |  "
+                    f"{printings_imported:>7,} impressions  |  "
                     f"{errors_count} erreurs"
                 )
 
@@ -737,6 +779,20 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
             log.error(f"[BATCH] dernier batch : {exc}")
             _safe_rollback(session)
             errors_count += len(card_rows_buf)
+
+    # Écart entre ce que le bulk contient et ce qui a été upserté. C'est
+    # exactement ce chiffre qui manquait : la déduplication écartait 22 037 des
+    # 542 827 lignes sans que rien ne l'affiche, le compteur publié étant celui
+    # des survivantes. Le tracer à chaque run rend la récidive immédiatement
+    # visible, quelle qu'en soit la cause.
+    ecart = lignes_lues - printings_imported - errors_count
+    log.info(f"Lignes lues dans le bulk : {lignes_lues:,}")
+    if ecart:
+        log.warning(
+            f"{ecart:,} ligne(s) du bulk n'ont produit aucune impression "
+            f"({ecart / lignes_lues:.2%} du fichier). Attendu : uniquement les "
+            f"lignes sans oracle_id (jetons, cartes d'art)."
+        )
 
     return cards_imported, printings_imported, errors_count
 
@@ -802,7 +858,8 @@ def main() -> None:
             purge_old_files(RAW_DIR, keep=args.keep_bulks, current=filename, logger=log)
 
         if dest.exists() and not args.force:
-            log.info(f"Fichier déjà présent ({dest.stat().st_size / 1_048_576:.0f} Mo). Utilise --force pour retélécharger.")
+            log.info(f"Fichier déjà présent ({dest.stat().st_size / 1_048_576:.0f} Mo). "
+                     f"Utilise --force pour retélécharger.")
         else:
             log.info(f"Téléchargement vers {dest} ...")
             download_bulk_file(client, download_uri, dest)

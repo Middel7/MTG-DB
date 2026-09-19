@@ -98,7 +98,10 @@ def assert_remote_database(url: Optional[str] = None) -> None:
     if not enforced or env_flag("MTGDB_ALLOW_LOCAL_DB"):
         return
     if is_local_database_url(target):
-        contexte = "ce run tourne en conteneur" if in_container() else                    "ce run exige une base distante (MTGDB_REQUIRE_REMOTE_DB)"
+        contexte = (
+            "ce run tourne en conteneur" if in_container()
+            else "ce run exige une base distante (MTGDB_REQUIRE_REMOTE_DB)"
+        )
         raise LocalDatabaseRefused(
             f"DATABASE_URL pointe sur une base locale ({redact_database_url(target)}) "
             f"alors que {contexte} : ce n'est pas la production. "

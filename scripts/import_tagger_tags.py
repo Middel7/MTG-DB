@@ -10,7 +10,7 @@ Flux :
 
 Usage :
   python scripts/import_tagger_tags.py                  # cartes sans tags uniquement
-  python scripts/import_tagger_tags.py --all            # toutes les cartes (remplace les tags existants)
+  python scripts/import_tagger_tags.py --all            # toutes les cartes (remplace l'existant)
   python scripts/import_tagger_tags.py --limit 500      # limite à N cartes (test)
   python scripts/import_tagger_tags.py --delay 0.3      # délai entre requêtes (défaut : 0.2s)
 
@@ -38,10 +38,10 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
-from urllib.parse import quote
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from tqdm import tqdm
@@ -200,7 +200,8 @@ SEUIL_ECHEC = 0.20
 # SÉLECTION DES CARTES À TRAITER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_cards_to_process(session: Session, only_missing: bool, limit: Optional[int]) -> list[tuple[int, str, str, str]]:
+def fetch_cards_to_process(session: Session, only_missing: bool,
+                           limit: Optional[int]) -> list[tuple[int, str, str, str]]:
     """
     Retourne une liste de (card_id, card_name, set_code, collector_number).
     Choisit une impression anglaise en priorité, sinon la première disponible.
@@ -339,9 +340,11 @@ def main() -> None:
                         log.info("Token CSRF expiré, rafraîchissement...")
                         try:
                             csrf_token = refresh_session(client)
-                            tag_names = graphql_request(client, csrf_token, set_code, collector_number)
+                            tag_names = graphql_request(
+                                client, csrf_token, set_code, collector_number)
                         except Exception as e:
-                            log.warning("Échec après rafraîchissement CSRF pour %s : %s", card_name, e)
+                            log.warning("Échec après rafraîchissement CSRF pour %s : %s",
+                                        card_name, e)
                             errors += 1
                             continue
                     except _TaggerIndisponible as e:
@@ -349,7 +352,8 @@ def main() -> None:
                         errors += 1
                         continue
                     except Exception as e:
-                        log.warning("Erreur pour %s (%s/%s) : %s", card_name, set_code, collector_number, e)
+                        log.warning("Erreur pour %s (%s/%s) : %s",
+                                    card_name, set_code, collector_number, e)
                         errors += 1
                         continue
 
