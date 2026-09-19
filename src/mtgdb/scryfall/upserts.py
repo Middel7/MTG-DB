@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import column, delete, or_, select, update, values
+from sqlalchemy import cast, column, delete, or_, select, update, values
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -44,16 +44,33 @@ COLONNES_CARTE = (
 
 def _table_de_valeurs(modele, noms: tuple[str, ...], lignes: list[dict], alias: str):
     """
-    Construit un `VALUES (…), (…)` typé à partir des lignes à écrire.
+    Construit un `VALUES (…), (…)` à partir des lignes à écrire.
 
-    Les types viennent du modèle : sans eux, PostgreSQL ne sait pas déduire le
-    type d'une colonne dont toutes les valeurs du lot sont NULL — ce qui arrive
-    couramment sur `printed_name` ou `cardmarket_id` — et refuse la requête.
+    Déclarer le type des colonnes ne suffit PAS à typer le SQL émis : SQLAlchemy
+    n'ajoute un `::type` que pour certains types, les tableaux notamment. Quand
+    toutes les valeurs d'une colonne du lot valent NULL — cas courant sur
+    `edhrec_rank`, `printed_name` ou `cardmarket_id` — PostgreSQL la type en
+    `text` par défaut, et la requête échoue sur
+
+        operator does not exist: integer = text
+
+    C'est `_colonne()` qui règle cela, en castant à l'usage.
     """
     colonnes = [column(nom, modele.__table__.c[nom].type) for nom in noms]
     return values(*colonnes, name=alias).data(
         [tuple(ligne.get(nom) for nom in noms) for ligne in lignes]
     )
+
+
+def _colonne(table_valeurs, modele, nom: str):
+    """
+    Référence une colonne du `VALUES`, castée dans le type de la table cible.
+
+    Le cast n'est pas une précaution de style : sans lui, une colonne entièrement
+    NULL dans le lot arrive en `text` et fait échouer la comparaison comme
+    l'affectation. Il est sans coût — PostgreSQL le résout à la planification.
+    """
+    return cast(table_valeurs.c[nom], modele.__table__.c[nom].type)
 
 
 def _separer(session: Session, modele, cle: str, rows: list[dict]) -> tuple[dict, list, list]:
@@ -116,11 +133,11 @@ def upsert_cards(session: Session, rows: list[dict]) -> dict[str, int]:
             # N'écrire que ce qui change réellement : sans ce prédicat, chaque
             # ligne identique produit tout de même un tuple mort et du WAL.
             .where(or_(*[
-                getattr(Card, colonne).is_distinct_from(v.c[colonne])
+                getattr(Card, colonne).is_distinct_from(_colonne(v, Card, colonne))
                 for colonne in COLONNES_CARTE
             ]))
             .values({
-                **{colonne: v.c[colonne] for colonne in COLONNES_CARTE},
+                **{colonne: _colonne(v, Card, colonne) for colonne in COLONNES_CARTE},
                 "updated_at": func.now(),
             })
         )
@@ -160,10 +177,10 @@ def ecrire_sets(session: Session, rows: list[dict]) -> None:
             update(MtgSet)
             .where(MtgSet.code == v.c.code)
             .where(or_(*[
-                getattr(MtgSet, colonne).is_distinct_from(v.c[colonne])
+                getattr(MtgSet, colonne).is_distinct_from(_colonne(v, MtgSet, colonne))
                 for colonne in COLONNES_SET
             ]))
-            .values({colonne: v.c[colonne] for colonne in COLONNES_SET})
+            .values({colonne: _colonne(v, MtgSet, colonne) for colonne in COLONNES_SET})
         )
 
 
@@ -222,9 +239,10 @@ def upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
 
         def valeur_cible(col: str):
             """Ce que la colonne vaudra après l'écriture."""
+            valeur = _colonne(v, CardPrinting, col)
             if col in PRESERVE_IF_NULL:
-                return func.coalesce(v.c[col], getattr(CardPrinting, col))
-            return v.c[col]
+                return func.coalesce(valeur, getattr(CardPrinting, col))
+            return valeur
 
         session.execute(
             update(CardPrinting)

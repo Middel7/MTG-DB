@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mtgdb.db.engine import SessionLocal, check_connection, engine
 from mtgdb.db.retry import retry_transient
 from mtgdb.db.runs import finaliser_run, marquer_runs_orphelins, ouvrir_run
+from mtgdb.db.sequences import journaliser as journaliser_sequences
 from mtgdb.rawfiles import purge_old_files
 from mtgdb.runtime import env_flag
 from mtgdb.scryfall.bulk import (
@@ -238,6 +239,12 @@ def main() -> None:
                 log.info(f"  Erreurs         : {errors_n:>10}")
                 log.info(f"  Durée           : {elapsed:>9}s")
                 log.info("=" * 47)
+
+                # Les colonnes `id` sont des integer. Tracer leur consommation à
+                # chaque run est le seul moyen de voir revenir une régression sur
+                # les upserts : elle ne se manifesterait, sinon, que le jour où
+                # une séquence bute sur son plafond et bloque les insertions.
+                journaliser_sequences(session)
 
                 # Un run 'partial' doit SORTIR en echec. Le marquer en base ne
                 # suffisait pas : le processus rendait 0, `update_all.py` affichait
