@@ -7,7 +7,6 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-
 # ── Product Catalog ───────────────────────────────────────────────────────────
 
 def _get(obj: dict, *keys: str, default: Any = None) -> Any:
@@ -86,7 +85,8 @@ _PRICE_KEY_MAP = {
     "foil_sell":       ("avg-foil", "foilSell", "foil_sell", "FoilSell"),
     "foil_low":        ("low-foil", "foilLow", "foil_low", "FoilLow", "Foil Low"),
     "foil_trend":      ("trend-foil", "foilTrend", "foil_trend", "FoilTrend", "Foil Trend"),
-    "low_price_ex_plus": ("lowEx", "lowPriceExPlus", "low_price_ex_plus", "Low Price Ex+", "lowExPlus"),
+    "low_price_ex_plus": ("lowEx", "lowPriceExPlus", "low_price_ex_plus",
+                          "Low Price Ex+", "lowExPlus"),
     "avg1":            ("avg1", "Avg1", "AVG1"),
     "avg7":            ("avg7", "Avg7", "AVG7"),
     "avg30":           ("avg30", "Avg30", "AVG30"),

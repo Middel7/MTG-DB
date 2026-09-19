@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from mtgdb.db.models.cardmarket_import_file import CardmarketImportFile
 
@@ -41,6 +41,34 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65_536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def marquer_imports_orphelins(session: Session, older_than_hours: int = 6) -> int:
+    """
+    Marque `failed` les imports Cardmarket restés `started`.
+
+    Symétrique de `mtgdb.db.runs.marquer_runs_orphelins`, qui n'existait que pour
+    Scryfall. Un import interrompu — conteneur arrêté, base injoignable — laissait
+    sa ligne en `started` indéfiniment : une du 07/06/2026 traînait encore trois
+    mois plus tard. Sans conséquence sur les données, puisque
+    `_last_successful_import` ne regarde que les `success`, mais l'historique
+    devenait illisible et cette table inutilisable pour superviser quoi que ce soit.
+    """
+    from sqlalchemy import text as sa_text
+
+    resultat = session.execute(sa_text("""
+        UPDATE cardmarket_import_files
+           SET status = 'failed',
+               finished_at = now(),
+               error_message = COALESCE(
+                   error_message,
+                   'Import orphelin : processus interrompu avant la fin. '
+                   'Marqué par un import ultérieur.')
+         WHERE status = 'started'
+           AND started_at < now() - make_interval(hours => :heures)
+    """), {"heures": older_than_hours})
+    session.commit()
+    return resultat.rowcount
 
 
 def download_file(
@@ -94,25 +122,63 @@ def download_file(
     filename = url.rsplit("/", 1)[-1].replace(".json", f"_{timestamp}.json")
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / filename
+    # Écriture dans un fichier temporaire, renommé une fois complet. Sans cela,
+    # une interruption en cours de transfert laisse un JSON tronqué portant un nom
+    # parfaitement valide : le run suivant le prend pour un export complet, et le
+    # diagnostic part sur « Cardmarket nous envoie du JSON corrompu ».
+    # `os.replace` est atomique sur le même système de fichiers.
+    partiel = dest.with_suffix(dest.suffix + ".part")
 
     log.info(f"  [{file_type}] Téléchargement vers {dest} ...")
     try:
         with client.stream("GET", url, headers=HTTP_HEADERS, follow_redirects=True) as resp:
             resp.raise_for_status()
-            with open(dest, "wb") as f:
+            with open(partiel, "wb") as f:
                 for chunk in resp.iter_bytes(chunk_size=65_536):
                     f.write(chunk)
     except Exception as exc:
+        partiel.unlink(missing_ok=True)
         import_row.status = "failed"
         import_row.error_message = str(exc)
         import_row.finished_at = datetime.now(timezone.utc)
         session.commit()
         raise
 
-    sha256 = _sha256_file(dest)
+    # Contrôle de complétude quand le serveur a annoncé une taille. Un transfert
+    # coupé net après un `raise_for_status()` réussi ne lève rien par lui-même.
+    taille = partiel.stat().st_size
+    if content_length and taille != content_length:
+        partiel.unlink(missing_ok=True)
+        message = (f"téléchargement incomplet : {taille:,} octets reçus sur "
+                   f"{content_length:,} annoncés")
+        import_row.status = "failed"
+        import_row.error_message = message
+        import_row.finished_at = datetime.now(timezone.utc)
+        session.commit()
+        raise OSError(f"[{file_type}] {message}")
+
+    sha256 = _sha256_file(partiel)
+
+    # Le sha256 était calculé puis jamais comparé, alors qu'il porte une contrainte
+    # d'unicité `(file_type, sha256)`. Deux conséquences : la déduplication qu'il
+    # permettait n'existait pas, et un contenu identique à un import réussi
+    # précédent — cas atteint dès que le HEAD échoue et que la comparaison d'ETag
+    # est sautée — faisait lever une IntegrityError non capturée, en plein milieu
+    # du chemin nominal dégradé.
+    if last and last.sha256 == sha256:
+        log.info(f"  [{file_type}] Contenu identique au dernier import réussi "
+                 f"(sha256={sha256[:12]}…) — import ignoré.")
+        partiel.unlink(missing_ok=True)
+        import_row.status = "skipped_not_modified"
+        import_row.finished_at = datetime.now(timezone.utc)
+        session.commit()
+        return None, import_row
+
+    partiel.replace(dest)
     import_row.local_file_path = str(dest)
     import_row.sha256 = sha256
     session.commit()
 
-    log.info(f"  [{file_type}] Téléchargé ({dest.stat().st_size / 1_048_576:.1f} Mo) sha256={sha256[:12]}…")
+    log.info(f"  [{file_type}] Téléchargé ({dest.stat().st_size / 1_048_576:.1f} Mo) "
+             f"sha256={sha256[:12]}…")
     return dest, import_row

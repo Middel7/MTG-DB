@@ -18,8 +18,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 load_dotenv(ROOT / ".env")
 
-from mtgdb.db.base import Base  # noqa: E402
 import mtgdb.db.models  # noqa: E402, F401
+from mtgdb.db.base import Base  # noqa: E402
 from mtgdb.db.urls import normalize_database_url  # noqa: E402
 
 config = context.config

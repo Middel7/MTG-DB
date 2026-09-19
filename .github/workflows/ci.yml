@@ -1,0 +1,97 @@
+# Intégration continue — MTG-DB
+#
+# Proportionnée au dépôt : trois emplois, pas davantage. Elle existe parce qu'un
+# défaut qui écartait 4 % des impressions à chaque run a vécu plusieurs mois sans
+# être vu, et qu'un test de dix lignes l'aurait arrêté le jour même.
+#
+# Ce qu'elle NE fait pas, délibérément :
+#   - aucune connexion à une base réelle du projet (manamind, relictrade) ;
+#     `postgres:16` est un conteneur jetable, recréé à chaque exécution ;
+#   - aucun déploiement : Render reconstruit l'image lui-même sur push (autoDeploy) ;
+#   - aucun build Docker, qui ferait doublon avec Render pour ~2 min par run.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Une exécution par branche : un push qui en suit un autre annule le précédent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualite:
+    name: Lint et tests unitaires
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Installer les dépendances
+        # --frozen : uv.lock fait foi. Un lock désynchronisé du pyproject doit
+        # faire échouer la CI, pas être silencieusement résolu à la volée.
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Tests sans base
+        # Les tests `integration` ont besoin de PostgreSQL : ils tournent dans
+        # l'autre job. Celui-ci doit rester exécutable en quelques secondes.
+        run: uv run pytest -m "not integration" -q
+
+  postgres:
+    name: Migrations et tests d'intégration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # 16 et non la version du poste (18.4) : c'est ce que proposent Render et
+        # les hébergeurs visés. Tester sur une version plus récente que la cible
+        # laisserait passer une incompatibilité descendante.
+        image: postgres:16
+        env:
+          POSTGRES_USER: mtgdb
+          POSTGRES_PASSWORD: mtgdb
+          POSTGRES_DB: mtgdb_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://mtgdb:mtgdb@localhost:5432/mtgdb_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Installer les dépendances
+        run: uv sync --frozen
+
+      - name: Base vierge → upgrade head
+        # Le scénario que personne ne rejoue jamais à la main, et dont dépend
+        # pourtant toute reconstruction : une base neuve doit accepter la chaîne
+        # complète des migrations.
+        run: uv run alembic upgrade head
+
+      - name: Les modèles correspondent-ils au schéma migré ?
+        # `alembic check` échoue si un autogenerate produirait encore quelque
+        # chose : c'est la garantie que modèles et migrations ne divergent pas.
+        run: uv run alembic check
+
+      - name: Tests d'intégration
+        run: uv run pytest -q

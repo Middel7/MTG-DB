@@ -76,7 +76,7 @@ def test_le_verrou_est_relache_meme_sur_exception(database_url):
     try:
         with pytest.raises(ZeroDivisionError):
             with advisory_lock(database_url, heartbeat_seconds=0):
-                1 / 0
+                1 / 0  # noqa: B018 — lever une exception, c'est tout l'objet du test
         assert not _verrou_tenu(engine, UPDATE_ALL_LOCK_KEY)
     finally:
         engine.dispose()
@@ -118,7 +118,8 @@ def test_update_all_sort_en_code_2_quand_le_verrou_est_tenu(database_url):
             errors="replace",
             timeout=120,
         )
-    assert proc.returncode == 2, f"code {proc.returncode} au lieu de 2\n{proc.stdout}\n{proc.stderr}"
+    assert proc.returncode == 2, (
+        f"code {proc.returncode} au lieu de 2\n{proc.stdout}\n{proc.stderr}")
     assert "verrou" in proc.stdout.lower()
     # Aucune étape ne doit avoir démarré.
     assert "[1/1]" not in proc.stdout

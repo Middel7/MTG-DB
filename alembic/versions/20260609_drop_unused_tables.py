@@ -15,7 +15,16 @@ depends_on = None
 
 def upgrade() -> None:
     op.drop_table("cardmarket_product_localizations")
-    op.drop_table("card_pricing_rules")
+    # IF EXISTS : `card_pricing_rules` n'a jamais été créée par une migration de
+    # ce dépôt — elle existait sur la base historique, d'où elle qu'elle ait pu
+    # venir. Sans cette tolérance, `alembic upgrade head` sur une base VIERGE
+    # échoue ici (« table card_pricing_rules does not exist ») et la chaîne
+    # devient injouable : impossible de monter un environnement de test, de
+    # recette, ou de reconstruire après un sinistre.
+    #
+    # Le comportement sur les bases existantes est inchangé : la table y est
+    # présente, elle est supprimée comme avant.
+    op.execute("DROP TABLE IF EXISTS card_pricing_rules")
 
 
 def downgrade() -> None:

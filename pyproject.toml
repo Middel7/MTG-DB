@@ -30,8 +30,13 @@ dependencies = [
 
 # Dépendances de développement : installées par `uv sync`, exclues de l'image
 # par le `uv sync --frozen --no-dev` du Dockerfile.
+#
+# Ruff est épinglé sur une version mineure. Le dépôt ne fixait aucun `select` et
+# n'installait pas l'outil : le résultat du lint dépendait donc entièrement de la
+# version que chacun avait sous la main — un jeu de règles par défaut qui s'élargit
+# d'une version à l'autre fait échouer la CI sans qu'une seule ligne ait changé.
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.16,<0.17"]
 
 [build-system]
 requires = ["hatchling"]
@@ -44,6 +49,29 @@ packages = ["src/mtgdb"]
 line-length = 100
 target-version = "py312"
 src = ["src"]
+
+# Jeu de règles EXPLICITE, et non le défaut de l'outil : celui-ci s'élargit au fil
+# des versions de Ruff, et une CI qui passe aujourd'hui échouerait demain sur du
+# code inchangé.
+#
+#   E, F  erreurs réelles (pycodestyle, pyflakes) — le socle
+#   I     ordre des imports, pour que les diffs ne se disputent pas cette ligne
+#   B     pièges courants (mutable default, closure sur variable de boucle…)
+#
+# Volontairement ABSENT : `UP`. La modernisation des annotations
+# (`Optional[str]` → `str | None`) toucherait ~140 lignes réparties dans tout le
+# dépôt pour un gain nul en fiabilité, et noierait les vrais changements.
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Les scripts DOIVENT insérer `src/` dans sys.path avant d'importer `mtgdb` :
+# ils vivent hors du wheel et s'exécutent par chemin (voir plus haut). E402 y est
+# la conséquence d'un choix assumé, pas un oubli.
+"scripts/*.py" = ["E402"]
+# Les migrations portent de longues docstrings explicatives et du SQL littéral.
+"alembic/versions/*.py" = ["E501"]
+"alembic/env.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

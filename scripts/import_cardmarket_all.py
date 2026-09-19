@@ -13,10 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.cardmarket import PRICE_GUIDE_URL, PRODUCT_CATALOG_URL
-from mtgdb.cardmarket.download import download_file
+from mtgdb.cardmarket.download import download_file, marquer_imports_orphelins
 from mtgdb.cardmarket.import_price_guide import import_price_guide, purge_old_captures
 from mtgdb.cardmarket.import_product_catalog import import_product_catalog
-from mtgdb.cardmarket.link_scryfall import link_scryfall
+from mtgdb.cardmarket.link_scryfall import link_scryfall, rapport_croissance
 from mtgdb.db.engine import SessionLocal, check_connection
 from mtgdb.rawfiles import purge_old_files
 
@@ -57,9 +57,16 @@ def main() -> None:
     with httpx.Client(timeout=httpx.Timeout(30.0, read=300.0)) as client:
         with SessionLocal() as session:
 
+            orphelins = marquer_imports_orphelins(session)
+            if orphelins:
+                log.warning(
+                    "%d import(s) Cardmarket reste(s) 'started' marque(s) 'failed' "
+                    "— processus interrompu sans finalisation.", orphelins)
+
             log.info("=== 1/3 Product Catalog ===")
             path, row = download_file(
-                client, session, PRODUCT_CATALOG_URL, "product_catalog_magic_singles", RAW_CATALOG_DIR
+                client, session, PRODUCT_CATALOG_URL,
+                "product_catalog_magic_singles", RAW_CATALOG_DIR,
             )
             if path:
                 import_product_catalog(path, session, row)
@@ -88,6 +95,7 @@ def main() -> None:
 
             log.info("=== 3/3 Rapport de liaison ===")
             link_scryfall(session)
+            rapport_croissance(session)
 
 
 if __name__ == "__main__":

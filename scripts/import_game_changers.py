@@ -99,7 +99,8 @@ def update_database(game_changer_names: list[str], dry_run: bool = False) -> Non
             else:
                 norm = _normalize(name)
                 r2 = conn.execute(
-                    text("UPDATE scryfall_cards SET game_changer = true WHERE normalized_name = :n"),
+                    text("UPDATE scryfall_cards SET game_changer = true "
+                         "WHERE normalized_name = :n"),
                     {"n": norm},
                 )
                 if r2.rowcount > 0:

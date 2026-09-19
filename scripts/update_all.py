@@ -359,7 +359,8 @@ def main() -> None:
         epilog="Étapes : scryfall | cardmarket | game-changers | tags",
     )
     parser.add_argument("--skip", nargs="+", metavar="ÉTAPE", help="Étape(s) à ignorer")
-    parser.add_argument("--only", nargs="+", metavar="ÉTAPE", help="Ne lancer QUE cette/ces étape(s)")
+    parser.add_argument("--only", nargs="+", metavar="ÉTAPE",
+                        help="Ne lancer QUE cette/ces étape(s)")
     parser.add_argument("--force", action="store_true",
                         help="Réimporte le bulk Scryfall même s'il l'a déjà été")
     parser.add_argument("--tags-all", action="store_true",
