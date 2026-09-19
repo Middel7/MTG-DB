@@ -38,7 +38,8 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.db.engine import SessionLocal, check_connection, engine
+from mtgdb.db.retry import retry_transient
 from mtgdb.rawfiles import purge_old_files
 from mtgdb.db.models.card import Card, normalize_card_name
 from mtgdb.db.models.card_face import CardFace
@@ -138,6 +139,107 @@ def _iter_bulk_cards(file_path: Path):
             if not line or line in ("[", "]"):
                 continue
             yield json.loads(line)
+
+
+def _safe_rollback(session: Session) -> None:
+    """
+    Remet la session en état, sans jamais lever.
+
+    Un rollback ouvre lui-même une connexion quand la précédente est morte : sur
+    une base indisponible il échoue à son tour. C'est ce qui a tué le run du
+    19/09 — l'erreur de nettoyage, levée depuis un bloc `except`, a remplacé
+    l'erreur d'origine et est remontée hors de tout rattrapage.
+
+    `engine.dispose()` force le pool à jeter ses connexions : sans lui, la
+    tentative suivante réutiliserait le même socket fermé et échouerait pour une
+    raison qui n'a plus rien à voir avec l'état réel de la base.
+    """
+    try:
+        session.rollback()
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"Rollback impossible (connexion morte ?) : {exc}")
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"Recyclage du pool impossible : {exc}")
+
+
+def fail_orphan_runs(session: Session, source: str = "scryfall",
+                     older_than_hours: int = 6) -> int:
+    """
+    Marque `failed` les runs restés `running` d'un processus qui n'existe plus.
+
+    Un run tué brutalement (conteneur arrêté, base injoignable au moment
+    d'écrire son statut) laisse une ligne `running` éternelle. Trois dégâts :
+    la supervision croit un import en cours, `bulk_already_imported` ne voit
+    jamais de succès pour ce bulk, et l'historique devient illisible.
+
+    Le seuil de 6 h est une sécurité, pas la garantie principale : c'est le
+    verrou advisory qui assure qu'aucun autre run ne tourne. Il couvre le cas
+    d'un run lancé avec `--no-lock`, où cette garantie n'existe plus.
+    """
+    from sqlalchemy import text as sa_text
+
+    result = session.execute(sa_text("""
+        UPDATE import_runs
+        SET status = 'failed',
+            finished_at = now(),
+            error_message = COALESCE(
+                error_message,
+                'Run orphelin : processus interrompu avant d''avoir pu écrire son statut. '
+                'Marqué par un run ultérieur.')
+        WHERE source = :source
+          AND status = 'running'
+          AND started_at < now() - make_interval(hours => :heures)
+    """), {"source": source, "heures": older_than_hours})
+    session.commit()
+    return result.rowcount
+
+
+def finalize_run(run_id: int, status: str, *, cards: int = 0, printings: int = 0,
+                 errors: int = 0, error_message: str | None = None) -> bool:
+    """
+    Écrit le statut final d'un run dans une session NEUVE. Retourne False si
+    même cela a échoué.
+
+    Pourquoi ne pas réutiliser la session du run : quand le statut à écrire est
+    `failed`, la cause la plus probable est une base injoignable. La session en
+    cours est alors dans un état indéterminé, et un `rollback` y expire les
+    objets ORM — les attributs qu'on vient d'affecter seraient rechargés depuis
+    la base, donc perdus, et le commit n'écrirait rien. Un `UPDATE` explicite
+    sur une connexion neuve ne dépend d'aucun état accumulé.
+    """
+    from sqlalchemy import text as sa_text
+
+    def _ecrire() -> bool:
+        with SessionLocal() as session_finale:
+            session_finale.execute(sa_text("""
+                UPDATE import_runs
+                SET status = :status,
+                    finished_at = now(),
+                    cards_imported = :cards,
+                    printings_imported = :printings,
+                    errors_count = :errors,
+                    error_message = :message
+                WHERE id = :id
+            """), {"status": status, "cards": cards, "printings": printings,
+                   "errors": errors, "message": error_message, "id": run_id})
+            session_finale.commit()
+        return True
+
+    try:
+        return retry_transient(
+            _ecrire,
+            description=f"enregistrement du statut '{status}' du run #{run_id}",
+            on_retry=lambda: engine.dispose() if engine is not None else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            f"Statut '{status}' non enregistre pour le run #{run_id} ({exc}). "
+            f"Il restera 'running' jusqu'a ce qu'un run ulterieur le marque orphelin."
+        )
+        return False
 
 
 def bulk_already_imported(session: Session, download_uri: str) -> bool:
@@ -394,6 +496,24 @@ def _replace_faces(session: Session, face_rows: list[dict], card_ids: list[int])
         session.execute(pg_insert(CardFace).values(face_rows))
 
 
+# Colonnes que le bulk Scryfall ne renseigne que pour UNE PARTIE des impressions,
+# et dont une valeur absente ne signifie donc pas « cette valeur a disparu ».
+#
+# cardmarket_id : Scryfall ne le fournit que sur l'impression anglaise. Écrasé
+# tel quel, il repassait à NULL sur les 401 230 impressions non anglaises À
+# CHAQUE RUN — que `propagate_cardmarket_ids()` repeuplait juste après, en
+# recopiant la valeur depuis l'impression anglaise de la même carte. Soit 77 %
+# de la table réécrite deux fois par run pour revenir au point de départ :
+# 24 minutes sur la base de production, mesurées le 19/09.
+#
+# Conséquence assumée : un cardmarket_id ne peut plus être EFFACÉ par le bulk.
+# Si Scryfall retire l'identifiant d'un produit délisté, l'ancienne valeur
+# subsiste. C'était déjà largement le cas — la propagation la recopiait depuis
+# une impression voisine — et le rapport de liaison Cardmarket surveille cet
+# écart (« Sans correspondance CM », 10 lignes au 19/09).
+PRESERVE_IF_NULL = frozenset({"cardmarket_id"})
+
+
 def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
     update_cols = [
         "oracle_id", "card_id", "set_code", "collector_number", "lang",
@@ -405,7 +525,14 @@ def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
     stmt = pg_insert(CardPrinting).values(rows)
     stmt = stmt.on_conflict_do_update(
         index_elements=["scryfall_id"],
-        set_={col: getattr(stmt.excluded, col) for col in update_cols},
+        set_={
+            col: (
+                func.coalesce(getattr(stmt.excluded, col), getattr(CardPrinting, col))
+                if col in PRESERVE_IF_NULL
+                else getattr(stmt.excluded, col)
+            )
+            for col in update_cols
+        },
     )
     session.execute(stmt)
     scryfall_ids = [r["scryfall_id"] for r in rows]
@@ -557,14 +684,19 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
             continue
 
         if len(card_rows_buf) >= BATCH_SIZE:
+            lot_cartes, lot_bruts = card_rows_buf, raw_cards_buf
             try:
-                c, p = _flush_batch(session, card_rows_buf, raw_cards_buf, today)
+                c, p = retry_transient(
+                    lambda: _flush_batch(session, lot_cartes, lot_bruts, today),
+                    description=f"[BATCH] cartes {cards_imported}–{cards_imported + BATCH_SIZE}",
+                    on_retry=lambda: _safe_rollback(session),
+                )
                 cards_imported += c
                 printings_imported += p
             except Exception as exc:
                 log.error(f"[BATCH] cards {cards_imported}–{cards_imported + BATCH_SIZE}: {exc}")
-                session.rollback()
-                errors_count += len(card_rows_buf)
+                _safe_rollback(session)
+                errors_count += len(lot_cartes)
             finally:
                 card_rows_buf = []
                 raw_cards_buf = []
@@ -578,12 +710,16 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
 
     if card_rows_buf:
         try:
-            c, p = _flush_batch(session, card_rows_buf, raw_cards_buf, today)
+            c, p = retry_transient(
+                lambda: _flush_batch(session, card_rows_buf, raw_cards_buf, today),
+                description="[BATCH] dernier batch",
+                on_retry=lambda: _safe_rollback(session),
+            )
             cards_imported += c
             printings_imported += p
         except Exception as exc:
             log.error(f"[BATCH] dernier batch : {exc}")
-            session.rollback()
+            _safe_rollback(session)
             errors_count += len(card_rows_buf)
 
     return cards_imported, printings_imported, errors_count
@@ -666,6 +802,13 @@ def main() -> None:
             return
 
         with SessionLocal() as session:
+            orphelins = fail_orphan_runs(session)
+            if orphelins:
+                log.warning(
+                    f"{orphelins} run(s) precedent(s) restes 'running' marques 'failed' "
+                    f"— processus interrompu sans finalisation."
+                )
+
             run = ImportRun(
                 source="scryfall",
                 source_file=download_uri,
@@ -675,7 +818,8 @@ def main() -> None:
             session.add(run)
             session.commit()
             session.refresh(run)
-            log.info(f"Import run #{run.id} démarré.")
+            run_id = run.id  # conserve hors ORM : `run` est inutilisable si la session casse
+            log.info(f"Import run #{run_id} démarré.")
 
             started_at = datetime.now(timezone.utc)
             try:
@@ -687,20 +831,35 @@ def main() -> None:
                 cards_n, printings_n, errors_n = import_cards(dest, session)
 
                 log.info("Propagation des cardmarket_id aux impressions non-anglaises...")
-                propagated = propagate_cardmarket_ids(session)
+                propagated = retry_transient(
+                    lambda: propagate_cardmarket_ids(session),
+                    description="propagation cardmarket_id",
+                    on_retry=lambda: _safe_rollback(session),
+                )
                 log.info(f"  {propagated:,} impression(s) mise(s) à jour.")
 
                 log.info("Propagation des tcgplayer_id_en (ID anglais vers toutes les langues)...")
-                propagated_tcg = propagate_tcgplayer_id_en(session)
+                propagated_tcg = retry_transient(
+                    lambda: propagate_tcgplayer_id_en(session),
+                    description="propagation tcgplayer_id_en",
+                    on_retry=lambda: _safe_rollback(session),
+                )
                 log.info(f"  {propagated_tcg:,} impression(s) mise(s) à jour.")
 
                 elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
-                run.status = "success"
-                run.finished_at = datetime.now(timezone.utc)
-                run.cards_imported = cards_n
-                run.printings_imported = printings_n
-                run.errors_count = errors_n
-                session.commit()
+                # 'partial' et non 'success' des qu'une carte a ete perdue : un run
+                # ou 300 000 cartes ont echoue n'est pas un succes. Consequences
+                # voulues : bulk_already_imported() ne le voit pas, donc le prochain
+                # run reprend ce bulk ; et la supervision cote RELIC-Trade, qui
+                # compte les 'success', signale le decrochage.
+                statut_final = "success" if errors_n == 0 else "partial"
+                finalize_run(run_id, statut_final, cards=cards_n,
+                             printings=printings_n, errors=errors_n)
+                if errors_n:
+                    log.warning(
+                        f"Run marque 'partial' : {errors_n} carte(s) perdue(s). "
+                        f"Le prochain run reprendra ce bulk."
+                    )
 
                 log.info("")
                 log.info("=" * 47)
@@ -716,10 +875,8 @@ def main() -> None:
             except Exception as exc:
                 elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
                 log.error(f"Erreur fatale après {elapsed}s : {exc}", exc_info=True)
-                run.status = "failed"
-                run.finished_at = datetime.now(timezone.utc)
-                run.error_message = str(exc)
-                session.commit()
+                _safe_rollback(session)
+                finalize_run(run_id, "failed", error_message=str(exc)[:2000])
                 sys.exit(1)
 
 

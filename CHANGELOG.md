@@ -5,7 +5,114 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
-## [Non publié] — 2026-09-19
+## [Non publié] — 2026-09-19 (3) — Le bulk n'efface plus les cardmarket_id
+
+`cardmarket_id` n'est fourni par Scryfall que sur l'impression anglaise.
+L'upsert l'écrasait tel quel, remettant **401 230 impressions non anglaises à
+`NULL` à chaque run** — que `propagate_cardmarket_ids()` repeuplait juste après
+en recopiant la valeur depuis l'impression anglaise. 77 % de la table réécrite
+deux fois par run pour revenir au point de départ.
+
+### Modifié
+
+- `_upsert_printings()` : `cardmarket_id = coalesce(excluded.cardmarket_id,
+  scryfall_card_printings.cardmarket_id)`. Une seule colonne est concernée,
+  listée dans `PRESERVE_IF_NULL`.
+
+### Mesuré sur la base locale, même bulk
+
+| | Avant | Après |
+|---|---|---|
+| Lignes propagées | 401 359 | **0** |
+| Durée de la propagation | 68 s | **1 s** |
+| Import des cartes | 6 min 30 | 4 min 50 |
+| **Étape Scryfall complète** | **466 s** | **295 s** (−37 %) |
+
+Aucune donnée perdue : 519 124 impressions portent un `cardmarket_id` avant
+comme après. L'import des cartes gagne lui aussi, l'upsert ne réécrivant plus
+ces 401 230 lignes — donc moins de WAL et moins de tuples morts.
+
+Report attendu en production, où la propagation prend 24 à 25 min : étape
+Scryfall de **84 min à 45-60 min**, à confirmer par un vrai run.
+
+### Conséquence assumée
+
+Un `cardmarket_id` ne peut plus être **effacé** par le bulk. Si Scryfall retire
+l'identifiant d'un produit délisté, l'ancienne valeur subsiste. C'était déjà
+largement le cas — la propagation la recopiait depuis une impression voisine —
+et le rapport de liaison Cardmarket surveille cet écart (10 lignes sans
+correspondance au 19/09).
+
+### Non traité
+
+L'upsert réécrit toujours 520 463 tuples même quand rien n'a changé. C'est le
+dernier gros gisement, et il mérite sa propre livraison.
+
+---
+
+## [Non publié] — 2026-09-19 (2) — Résistance aux coupures de base
+
+Le premier run de production sur Render a échoué après 70 minutes, quand la base
+a cessé d'accepter les connexions (`the database system is not yet accepting
+connections / Consistent recovery state has not been yet reached`). Deuxième
+perte en trois jours après celle du 17/09 depuis le poste (`SSL connection has
+been closed unexpectedly`, 78 min). Dans les deux cas, l'interruption a duré
+moins longtemps que le travail jeté.
+
+L'enchaînement exact du 19/09 : un batch échoue → le `session.rollback()` du
+bloc de rattrapage tente de rouvrir une connexion et lève **à son tour** →
+l'exception remonte hors de tout `except` → le `session.commit()` final échoue
+pour la même raison → le processus meurt sans pouvoir marquer le run `failed`,
+qui reste `running` indéfiniment.
+
+### Ajouté
+
+- `src/mtgdb/db/retry.py` : détection des erreurs de transport et rejeu avec
+  attente croissante (5 s, 15 s, 30 s, 1 min, 2 min). Les erreurs de données —
+  contrainte, syntaxe — ne sont jamais rejouées.
+- `_safe_rollback()` dans `scripts/import_scryfall.py` : remet la session en
+  état sans jamais lever, et recycle le pool pour ne pas réutiliser un socket
+  mort.
+- `fail_orphan_runs()` : au démarrage, tout run `running` depuis plus de 6 h est
+  marqué `failed`. Le seuil est une sécurité ; la garantie réelle vient du
+  verrou advisory.
+- `finalize_run()` : écrit le statut final via une **session neuve**. Un
+  `rollback` sur la session accidentée expire les objets ORM et ferait perdre
+  silencieusement le statut qu'on vient d'y affecter.
+- 21 tests supplémentaires, dont les messages d'erreur exacts des deux
+  incidents, et un test d'intégration qui vérifie que la session du verrou n'est
+  pas `idle in transaction`.
+
+### Modifié
+
+- Les batches d'import et les deux propagations sont désormais rejoués sur
+  erreur transitoire, au lieu d'être comptés en erreur et abandonnés.
+- **Statut `partial`** : un run qui a perdu des cartes n'est plus marqué
+  `success`. Conséquences voulues — `bulk_already_imported()` ne le voit pas,
+  donc le prochain run reprend ce bulk ; et la supervision de RELIC-Trade, qui
+  compte les `success`, signale le décrochage. Auparavant, un run ayant perdu
+  300 000 cartes était enregistré comme un succès.
+- **Verrou en `AUTOCOMMIT`** : sans cela, SQLAlchemy ouvrait une transaction
+  implicite au premier battement du heartbeat et ne la refermait jamais. La
+  session restait `idle in transaction` pendant les deux heures du run, gelant
+  l'horizon de `VACUUM` — les tuples morts des 520 000 lignes réécrites ne
+  pouvaient plus être recyclés, ce qui aggravait l'IO qu'on cherche à réduire.
+  Vérifié en base : `idle in transaction` avant, `idle` après.
+- Le heartbeat **reprend** le verrou après une coupure, au lieu de se contenter
+  de la signaler. Si un autre run l'a pris entre-temps, le run en cours continue
+  malgré tout : un import à moitié appliqué est pire qu'un chevauchement, les
+  upserts étant idempotents.
+
+### Non traité
+
+Les deux gaspillages repérés dans l'import restent à corriger, et méritent une
+livraison séparée avec mesure entre chaque : `cardmarket_id` écrasé par `NULL`
+à chaque run puis repeuplé (401 230 lignes, ~24 min), et l'upsert qui réécrit
+520 463 tuples même quand rien n'a changé.
+
+---
+
+## [Non publié] — 2026-09-19 (1) — Bascule vers Render
 
 ### La production ne dépend plus d'un poste
 

@@ -25,10 +25,12 @@ from __future__ import annotations
 import logging
 import threading
 from contextlib import contextmanager
-from typing import Callable, Iterator
+from typing import Iterator
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, Engine
+
+from mtgdb.db.retry import is_transient_error
 
 log = logging.getLogger("mtgdb.db.lock")
 
@@ -59,6 +61,77 @@ class AdvisoryLockHeld(RuntimeError):
     """Un autre run détient déjà le verrou sur cette base."""
 
 
+class _LockHolder:
+    """
+    Porte le verrou : une connexion dédiée, maintenue vivante, reprise si besoin.
+
+    La connexion est en AUTOCOMMIT. Ce n'est pas un détail de style : sans lui,
+    SQLAlchemy ouvre une transaction implicite au premier `SELECT` et ne la
+    referme jamais. La session apparaît alors `idle in transaction` pendant les
+    deux heures du run, ce qui gèle l'horizon de `VACUUM` — sur un import qui
+    réécrit 520 000 lignes, les tuples morts s'accumulent sans pouvoir être
+    recyclés, et l'IO que l'on cherche à réduire empire. Un verrou consultatif
+    de session survit très bien à l'absence de transaction : c'est exactement ce
+    qui le distingue de `pg_advisory_xact_lock`.
+    """
+
+    def __init__(self, engine: Engine, key: int):
+        self._engine = engine
+        self._key = key
+        self._conn: Connection | None = None
+        self._guard = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        conn = self._engine.connect()
+        acquis = bool(conn.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                                   {"k": self._key}).scalar())
+        if acquis:
+            self._conn = conn
+        else:
+            conn.close()
+        return acquis
+
+    def ping(self) -> None:
+        """Vérifie que la connexion porteuse est toujours vivante."""
+        with self._guard:
+            if self._conn is not None:
+                self._conn.execute(text("SELECT 1"))
+
+    def reacquire(self) -> bool:
+        """
+        Reprend le verrou après une coupure. False si un autre l'a pris entre-temps.
+
+        Utile parce qu'une interruption de la base est désormais un incident dont
+        le run se relève (voir `mtgdb.db.retry`) : si le run survit, son verrou
+        doit survivre aussi, sinon la protection disparaît en silence pour le
+        reste des deux heures.
+        """
+        with self._guard:
+            ancienne, self._conn = self._conn, None
+            if ancienne is not None:
+                try:
+                    ancienne.close()
+                except Exception:  # noqa: BLE001 — elle est déjà morte
+                    pass
+            self._engine.dispose()
+            return self.try_acquire()
+
+    def release(self) -> None:
+        with self._guard:
+            conn, self._conn = self._conn, None
+            if conn is None:
+                return
+            try:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": self._key})
+            except Exception as exc:  # noqa: BLE001
+                # Sans importance : la fermeture de la session libère le verrou.
+                log.debug("pg_advisory_unlock a échoué (%s) — libéré à la déconnexion.", exc)
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class _Heartbeat:
     """
     Maintient vivante la connexion porteuse du verrou.
@@ -68,13 +141,12 @@ class _Heartbeat:
     `SELECT 1` périodique donne cette information tout de suite.
     """
 
-    def __init__(self, conn: Connection, interval: float, on_lost: Callable[[str], None]):
-        self._conn = conn
+    def __init__(self, holder: _LockHolder, interval: float):
+        self._holder = holder
         self._interval = interval
-        self._on_lost = on_lost
         self._stop = threading.Event()
-        self._guard = threading.Lock()
-        self._thread = threading.Thread(target=self._run, name="mtgdb-lock-heartbeat", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="mtgdb-lock-heartbeat",
+                                        daemon=True)
 
     def start(self) -> None:
         self._thread.start()
@@ -83,36 +155,36 @@ class _Heartbeat:
         self._stop.set()
         self._thread.join(timeout=5)
 
-    def ping(self) -> None:
-        """Exécute le ping. Le verrou d'exclusion protège de la libération concurrente."""
-        with self._guard:
-            if not self._stop.is_set():
-                self._conn.execute(text("SELECT 1"))
-
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             try:
-                self.ping()
-            except Exception as exc:  # noqa: BLE001 — on ne veut jamais tuer le run ici
-                self._on_lost(str(exc))
+                self._holder.ping()
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not is_transient_error(exc):
+                    log.error("Heartbeat du verrou interrompu (%s) — surveillance arrêtée.", exc)
+                    return
+                log.warning("Connexion du verrou perdue (%s). Tentative de reprise...", exc)
+
+            try:
+                repris = self._holder.reacquire()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Reprise du verrou impossible pour l'instant (%s).", exc)
+                continue
+
+            if repris:
+                log.info("Verrou repris après la coupure.")
+            else:
+                # On ne tue pas le run : un import à moitié appliqué est pire
+                # qu'un chevauchement. Les upserts sont idempotents, deux runs
+                # simultanés se recouvrent sans se corrompre, alors qu'un arrêt
+                # au milieu de 520 000 impressions laisse la base incomplète.
+                log.error(
+                    "Verrou perdu ET repris par un autre run. Celui-ci CONTINUE : "
+                    "l'interrompre laisserait la base a moitie a jour. Deux runs "
+                    "ecrivent peut-etre en parallele."
+                )
                 return
-
-
-def _lock_lost(reason: str) -> None:
-    """
-    Signale la perte du verrou sans interrompre le run.
-
-    Choix délibéré : un import à moitié appliqué est pire qu'un chevauchement.
-    Les upserts sont idempotents, deux runs simultanés se recouvrent sans se
-    corrompre ; en revanche, tuer un run au milieu de 520 000 impressions
-    laisserait la base dans un état partiel. On journalise fort et on continue.
-    """
-    log.error(
-        "Verrou advisory perdu en cours de run (%s). Le run CONTINUE : "
-        "l'interrompre laisserait la base à moitié à jour. Un second run "
-        "pourrait désormais démarrer en parallèle.",
-        reason,
-    )
 
 
 @contextmanager
@@ -137,34 +209,24 @@ def advisory_lock(
         database_url,
         pool_pre_ping=True,
         connect_args=_KEEPALIVE_ARGS,
-        # Le verrou est lié à la SESSION : la connexion doit rester la même du
-        # début à la fin. NullPool éviterait tout recyclage, mais on conserve
-        # ici une connexion explicitement tenue ouverte, ce qui suffit.
+        isolation_level="AUTOCOMMIT",
     )
-    conn = engine.connect()
+    holder = _LockHolder(engine, key)
     heartbeat: _Heartbeat | None = None
     try:
-        acquired = conn.execute(
-            text("SELECT pg_try_advisory_lock(:k)"), {"k": key}
-        ).scalar()
-        if not acquired:
+        if not holder.try_acquire():
             raise AdvisoryLockHeld(
                 f"Un autre run détient déjà le verrou {key} sur cette base "
                 f"(pg_try_advisory_lock). Il peut venir d'une autre machine."
             )
 
         if heartbeat_seconds > 0:
-            heartbeat = _Heartbeat(conn, heartbeat_seconds, _lock_lost)
+            heartbeat = _Heartbeat(holder, heartbeat_seconds)
             heartbeat.start()
 
         yield key
     finally:
         if heartbeat is not None:
             heartbeat.stop()
-        try:
-            conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
-        except Exception as exc:  # noqa: BLE001
-            # Sans importance : la fermeture de la session libère le verrou.
-            log.debug("pg_advisory_unlock a échoué (%s) — libéré à la déconnexion.", exc)
-        conn.close()
+        holder.release()
         engine.dispose()
