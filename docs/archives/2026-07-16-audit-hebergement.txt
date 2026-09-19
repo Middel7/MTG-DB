@@ -1,3 +1,14 @@
+> **DOCUMENT ARCHIVÉ — ne décrit plus l'état courant.**
+>
+> Audit d'hébergement du 16 juillet 2026, conservé pour la trace du raisonnement
+> qui a mené au choix de Render. La décision est prise et documentée dans
+> [`render.yaml`](../../render.yaml) et [`deploiement.md`](../deploiement.md).
+>
+> Plusieurs chiffres sont aujourd'hui faux : 14 révisions Alembic (il y en a 18),
+> `scryfall_card_printings` à 843 Mo (958 Mo mesurés le 19/09), pic disque de
+> 5,1 Go (ramené à un seul fichier depuis que la purge précède le téléchargement).
+> Ne pas s'en servir comme référence.
+
 # Rapport d'audit — MTG-DB (catalogue Magic) — 16 juillet 2026
 
 Audit **lecture seule** du dépôt `MTG-DB` (package Python `mtgdb`) et de l'instance PostgreSQL locale. Aucun fichier modifié, aucune écriture en base (sessions ouvertes en `SET SESSION READ ONLY`).

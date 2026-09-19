@@ -84,7 +84,12 @@ def update_database(game_changer_names: list[str], dry_run: bool = False) -> Non
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
-        result = conn.execute(text("UPDATE scryfall_cards SET game_changer = false"))
+        # `WHERE game_changer` : sans ce filtre, les 38 907 cartes de la table
+        # etaient reecrites a chaque run pour n'en changer qu'une cinquantaine.
+        # PostgreSQL produit un tuple mort par ligne touchee, meme quand la
+        # valeur ecrite est identique a l'ancienne.
+        result = conn.execute(
+            text("UPDATE scryfall_cards SET game_changer = false WHERE game_changer"))
         print(f"[DB] Reset game_changer=false sur {result.rowcount} cartes.")
 
         updated = 0

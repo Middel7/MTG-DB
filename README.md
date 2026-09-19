@@ -142,9 +142,14 @@ uv sync --group dev
 ```
 
 Les tests marqués `integration` ont besoin d'une vraie base PostgreSQL (celle de
-`DATABASE_URL`) : un verrou consultatif ne se simule pas utilement, c'est le
-serveur qui l'arbitre. Ils se sautent d'eux-mêmes si `DATABASE_URL` est absent,
-et n'écrivent rien — ils posent un verrou, vérifient `pg_locks`, et relâchent.
+`DATABASE_URL`) : un verrou consultatif ne se simule pas utilement, et une
+contrainte d'unicité sur des `NULL` encore moins — c'est le serveur qui arbitre.
+Ils se sautent d'eux-mêmes si `DATABASE_URL` est absent.
+
+Certains **écrivent** en base : `import_runs` pour les runs orphelins,
+`cardmarket_*` pour l'idempotence du Price Guide. Ils refusent donc de tourner
+ailleurs que sur une base locale (`is_local_database_url`), travaillent sur une
+plage d'identifiants réservée (≥ 900 000 000) et nettoient derrière eux.
 
 ---
 

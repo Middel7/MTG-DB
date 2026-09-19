@@ -1,7 +1,7 @@
 """Ajoute tcgplayer_id à scryfall_card_printings
 
 Revision ID: 20260710_add_tcgplayer_id
-Revises: 20260620_add_scryfall_card_tags
+Revises: 20260705_add_user_collection
 Create Date: 2026-07-10
 """
 import sqlalchemy as sa

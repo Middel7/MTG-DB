@@ -6,7 +6,6 @@ MISE À JOUR COMPLÈTE (recommandé)
 ─────────────────────────────────
 Enchaîne les 4 sources : Scryfall → Cardmarket → Game Changers → Tags Tagger.
 
-    cd "c:\Users\fabie\Documents\GitHub\MTG-DB"
     .\update.ps1
 
 Options utiles :
@@ -31,7 +30,7 @@ MISE À JOUR AUTOMATIQUE (tâches planifiées Windows)
 
 Crée deux tâches :
     MTG-DB Update   08:00 et 20:00 chaque jour   (--skip tags, ~7 min)
-    MTG-DB Tags     dimanche 03:00                (--only tags, ~40 min)
+    MTG-DB Tags     dimanche 05:00                (--only tags, ~40 min)
 
     Get-ScheduledTask -TaskName 'MTG-DB*'              # vérifier
     Start-ScheduledTask -TaskName 'MTG-DB Update'      # lancer maintenant
@@ -40,10 +39,18 @@ Crée deux tâches :
 
 PRODUCTION (Docker)
 ───────────────────
-    docker compose run --rm updater --skip tags
-    docker compose run --rm updater --only tags
+L'image declare un CMD et non un ENTRYPOINT : toute variante s'ecrit en
+COMMANDE COMPLETE. « docker compose run --rm updater --skip tags » ne
+fonctionne pas — Docker chercherait un binaire nomme « --skip ».
 
-Voir docs/deploiement.md pour le cron, la supervision et les secrets.
+    docker compose run --rm updater                                          # le CMD : --skip tags
+    docker compose run --rm updater python scripts/update_all.py --only tags
+    docker compose run --rm updater python scripts/update_all.py --dry-run
+
+En PRODUCTION, ce n'est plus docker-compose qui declenche les runs : deux Cron
+Jobs Render construisent cette meme image (voir render.yaml).
+
+Voir docs/deploiement.md pour l'ordonnancement, la supervision et les secrets.
 
 
 LANCEMENTS INDIVIDUELS (si besoin d'une seule étape)
