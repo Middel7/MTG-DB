@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import column, delete, or_, select, update, values
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -24,6 +24,7 @@ from mtgdb.db.models.card import Card
 from mtgdb.db.models.card_face import CardFace
 from mtgdb.db.models.card_price import CardPrice
 from mtgdb.db.models.card_printing import CardPrinting
+from mtgdb.db.models.mtg_set import MtgSet
 
 log = logging.getLogger("mtgdb.scryfall.upserts")
 
@@ -41,42 +42,129 @@ COLONNES_CARTE = (
 )
 
 
+def _table_de_valeurs(modele, noms: tuple[str, ...], lignes: list[dict], alias: str):
+    """
+    Construit un `VALUES (…), (…)` typé à partir des lignes à écrire.
+
+    Les types viennent du modèle : sans eux, PostgreSQL ne sait pas déduire le
+    type d'une colonne dont toutes les valeurs du lot sont NULL — ce qui arrive
+    couramment sur `printed_name` ou `cardmarket_id` — et refuse la requête.
+    """
+    colonnes = [column(nom, modele.__table__.c[nom].type) for nom in noms]
+    return values(*colonnes, name=alias).data(
+        [tuple(ligne.get(nom) for nom in noms) for ligne in lignes]
+    )
+
+
+def _separer(session: Session, modele, cle: str, rows: list[dict]) -> tuple[dict, list, list]:
+    """
+    Partage les lignes entre celles déjà en base et les nouvelles.
+
+    POURQUOI CE DÉTOUR PLUTÔT QU'UN SIMPLE `ON CONFLICT`
+    `INSERT … ON CONFLICT` consomme une valeur de séquence pour chaque ligne
+    PROPOSÉE, y compris celles qui finissent en `UPDATE` ou qui ne font rien :
+    `nextval()` est évalué à la construction de la ligne candidate, bien avant
+    que le conflit ne soit détecté. Rien ne la rend au moment du conflit.
+
+    Mesuré sur la base locale au 19/09/2026 :
+
+        cards_id_seq            39 840 157   pour      544 insertions réelles
+        card_printings_id_seq   40 830 218   pour   14 696 insertions réelles
+
+    Soit 1 024 fois et 75 fois le nombre de lignes des tables. Les colonnes `id`
+    étant des `integer`, ce gaspillage — et non la croissance des données —
+    fixait l'échéance d'épuisement du plafond 2 147 483 647.
+
+    Séparer coûte un `SELECT` de la clé métier par lot, et fait tomber la
+    consommation au nombre d'insertions véritables.
+    """
+    cles = [ligne[cle] for ligne in rows]
+    colonne_cle = getattr(modele, cle)
+    connus = {
+        valeur: identifiant
+        for valeur, identifiant in session.execute(
+            select(colonne_cle, modele.id).where(colonne_cle.in_(cles))
+        )
+    }
+    nouvelles = [ligne for ligne in rows if ligne[cle] not in connus]
+    existantes = [ligne for ligne in rows if ligne[cle] in connus]
+    return connus, nouvelles, existantes
+
+
 def upsert_cards(session: Session, rows: list[dict]) -> dict[str, int]:
-    stmt = pg_insert(Card).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["oracle_id"],
-        # N'écrire que ce qui change réellement. Sans ce prédicat, chaque upsert
-        # produit un UPDATE — donc un tuple mort, du WAL, et une valeur de
-        # séquence consommée — même quand la ligne est rigoureusement identique.
-        where=or_(*[
-            getattr(Card, colonne).is_distinct_from(getattr(stmt.excluded, colonne))
-            for colonne in COLONNES_CARTE
-        ]),
-        set_={
-            "name":             stmt.excluded.name,
-            "normalized_name":  stmt.excluded.normalized_name,
-            "mana_cost":        stmt.excluded.mana_cost,
-            "mana_value":       stmt.excluded.mana_value,
-            "type_line":        stmt.excluded.type_line,
-            "oracle_text":      stmt.excluded.oracle_text,
-            "power":            stmt.excluded.power,
-            "toughness":        stmt.excluded.toughness,
-            "loyalty":          stmt.excluded.loyalty,
-            "defense":          stmt.excluded.defense,
-            "colors":           stmt.excluded.colors,
-            "color_identity":   stmt.excluded.color_identity,
-            "keywords":         stmt.excluded.keywords,
-            "legal_commander":  stmt.excluded.legal_commander,
-            "edhrec_rank":      stmt.excluded.edhrec_rank,
-            "updated_at":       func.now(),
-        },
-    )
-    session.execute(stmt)
-    oracle_ids = [r["oracle_id"] for r in rows]
-    result = session.execute(
-        select(Card.id, Card.oracle_id).where(Card.oracle_id.in_(oracle_ids))
-    )
-    return {row.oracle_id: row.id for row in result}
+    """Écrit les cartes du lot et retourne la correspondance oracle_id → id."""
+    if not rows:
+        return {}
+
+    connus, nouvelles, existantes = _separer(session, Card, "oracle_id", rows)
+
+    # Seules les vraies insertions consomment la séquence.
+    if nouvelles:
+        resultat = session.execute(
+            pg_insert(Card)
+            .values(nouvelles)
+            .on_conflict_do_nothing(index_elements=["oracle_id"])
+            .returning(Card.oracle_id, Card.id)
+        )
+        connus.update(dict(resultat.all()))
+
+    if existantes:
+        v = _table_de_valeurs(Card, ("oracle_id", *COLONNES_CARTE), existantes, "cartes")
+        session.execute(
+            update(Card)
+            .where(Card.oracle_id == v.c.oracle_id)
+            # N'écrire que ce qui change réellement : sans ce prédicat, chaque
+            # ligne identique produit tout de même un tuple mort et du WAL.
+            .where(or_(*[
+                getattr(Card, colonne).is_distinct_from(v.c[colonne])
+                for colonne in COLONNES_CARTE
+            ]))
+            .values({
+                **{colonne: v.c[colonne] for colonne in COLONNES_CARTE},
+                "updated_at": func.now(),
+            })
+        )
+
+    return connus
+
+
+COLONNES_SET = (
+    "name", "set_type", "released_at", "block",
+    "parent_set_code", "card_count", "icon_svg_uri",
+)
+
+
+def ecrire_sets(session: Session, rows: list[dict]) -> None:
+    """
+    Écrit les éditions, sans brûler d'identifiant pour celles qui existent déjà.
+
+    1 051 éditions sont proposées à chaque run pour ~1 nouvelle par mois :
+    `mtg_sets_id_seq` était à 85 887 pour 1 051 lignes, soit 82 fois la taille de
+    la table. L'enjeu absolu est faible — 0,004 % du plafond `int4` — mais la
+    cause est exactement la même que sur les cartes et les impressions, et la
+    corriger ici évite qu'on se demande un jour pourquoi cette table-là fait
+    exception.
+    """
+    if not rows:
+        return
+    _, nouvelles, existantes = _separer(session, MtgSet, "code", rows)
+
+    if nouvelles:
+        session.execute(
+            pg_insert(MtgSet).values(nouvelles).on_conflict_do_nothing(index_elements=["code"])
+        )
+
+    if existantes:
+        v = _table_de_valeurs(MtgSet, ("code", *COLONNES_SET), existantes, "editions")
+        session.execute(
+            update(MtgSet)
+            .where(MtgSet.code == v.c.code)
+            .where(or_(*[
+                getattr(MtgSet, colonne).is_distinct_from(v.c[colonne])
+                for colonne in COLONNES_SET
+            ]))
+            .values({colonne: v.c[colonne] for colonne in COLONNES_SET})
+        )
 
 
 def replace_faces(session: Session, face_rows: list[dict], card_ids: list[int]) -> None:
@@ -103,60 +191,104 @@ def replace_faces(session: Session, face_rows: list[dict], card_ids: list[int]) 
 PRESERVE_IF_NULL = frozenset({"cardmarket_id"})
 
 
+COLONNES_IMPRESSION = (
+    "oracle_id", "card_id", "set_code", "collector_number", "lang",
+    "rarity", "released_at", "artist", "border_color", "frame",
+    "full_art", "promo", "reprint", "digital",
+    "image_small", "image_normal", "image_large", "scryfall_uri",
+    "cardmarket_id", "tcgplayer_id", "printed_name",
+)
+
+
 def upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
-    update_cols = [
-        "oracle_id", "card_id", "set_code", "collector_number", "lang",
-        "rarity", "released_at", "artist", "border_color", "frame",
-        "full_art", "promo", "reprint", "digital",
-        "image_small", "image_normal", "image_large", "scryfall_uri",
-        "cardmarket_id", "tcgplayer_id", "printed_name",
-    ]
-    stmt = pg_insert(CardPrinting).values(rows)
+    """Écrit les impressions du lot et retourne la correspondance scryfall_id → id."""
+    if not rows:
+        return {}
 
-    def valeur_cible(col: str):
-        """Ce que la colonne vaudra après l'upsert."""
-        if col in PRESERVE_IF_NULL:
-            return func.coalesce(getattr(stmt.excluded, col), getattr(CardPrinting, col))
-        return getattr(stmt.excluded, col)
+    connus, nouvelles, existantes = _separer(session, CardPrinting, "scryfall_id", rows)
 
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["scryfall_id"],
-        # Ne réécrire que les impressions réellement modifiées.
-        #
-        # Sans ce prédicat, les 520 000 lignes de la table étaient réécrites à
-        # chaque run, que le bulk ait changé quelque chose ou non : 43 785 680
-        # UPDATE cumulés pour 11 449 INSERT, mesurés dans pg_stat_user_tables.
-        # C'est le « dernier gros gisement » que le CHANGELOG du 19/09 identifiait
-        # sans le traiter.
-        #
-        # `IS DISTINCT FROM` et non `!=` : la table est pleine de NULL
-        # (cardmarket_id, printed_name, tcgplayer_id…), et `NULL != NULL` vaut
-        # NULL, donc faux — la moitié des colonnes ne serait jamais comparée.
-        #
-        # La comparaison porte sur la valeur CIBLE, coalesce comprise : sinon une
-        # impression dont le bulk ne fournit pas le cardmarket_id serait vue comme
-        # modifiée à chaque run, et on retomberait sur le problème d'origine.
-        where=or_(*[
-            getattr(CardPrinting, col).is_distinct_from(valeur_cible(col))
-            for col in update_cols
-        ]),
-        set_={col: valeur_cible(col) for col in update_cols},
-    )
-    session.execute(stmt)
-    scryfall_ids = [r["scryfall_id"] for r in rows]
-    result = session.execute(
-        select(CardPrinting.id, CardPrinting.scryfall_id)
-        .where(CardPrinting.scryfall_id.in_(scryfall_ids))
-    )
-    return {row.scryfall_id: row.id for row in result}
+    if nouvelles:
+        resultat = session.execute(
+            pg_insert(CardPrinting)
+            .values(nouvelles)
+            .on_conflict_do_nothing(index_elements=["scryfall_id"])
+            .returning(CardPrinting.scryfall_id, CardPrinting.id)
+        )
+        connus.update(dict(resultat.all()))
+
+    if existantes:
+        v = _table_de_valeurs(
+            CardPrinting, ("scryfall_id", *COLONNES_IMPRESSION), existantes, "impressions")
+
+        def valeur_cible(col: str):
+            """Ce que la colonne vaudra après l'écriture."""
+            if col in PRESERVE_IF_NULL:
+                return func.coalesce(v.c[col], getattr(CardPrinting, col))
+            return v.c[col]
+
+        session.execute(
+            update(CardPrinting)
+            .where(CardPrinting.scryfall_id == v.c.scryfall_id)
+            # Ne réécrire que les impressions réellement modifiées.
+            #
+            # `IS DISTINCT FROM` et non `!=` : la table est pleine de NULL
+            # (cardmarket_id, printed_name, tcgplayer_id…), et `NULL != NULL` vaut
+            # NULL, donc faux — la moitié des colonnes ne serait jamais comparée.
+            #
+            # La comparaison porte sur la valeur CIBLE, coalesce comprise : sinon
+            # une impression dont le bulk ne fournit pas le cardmarket_id serait
+            # vue comme modifiée à chaque run, et on retomberait sur le problème
+            # que `PRESERVE_IF_NULL` a résolu.
+            .where(or_(*[
+                getattr(CardPrinting, col).is_distinct_from(valeur_cible(col))
+                for col in COLONNES_IMPRESSION
+            ]))
+            .values({col: valeur_cible(col) for col in COLONNES_IMPRESSION})
+        )
+
+    return connus
+
+
+# Colonnes qui identifient un relevé de prix : la contrainte
+# `uq_card_prices_printing_date_type` porte exactement sur celles-ci.
+CLE_PRIX = ("printing_id", "date", "source", "currency", "price_type")
 
 
 def insert_prices(session: Session, rows: list[dict]) -> None:
+    """
+    Insère les relevés de prix absents, et ne propose que ceux-là.
+
+    `scryfall_card_prices` est append-only : un relevé par impression, par jour et
+    par type. Le deuxième run d'une même journée retrouve donc exactement les
+    mêmes clés, et son `ON CONFLICT DO NOTHING` n'insérait rien — tout en brûlant
+    une valeur de séquence par ligne proposée, soit ~218 000 par jour pour un
+    résultat nul.
+
+    Le `SELECT` préalable coûte une requête par lot et supprime entièrement cette
+    consommation.
+    """
     if not rows:
         return
-    stmt = pg_insert(CardPrice).values(rows)
-    stmt = stmt.on_conflict_do_nothing()
-    session.execute(stmt)
+
+    deja = {
+        tuple(ligne)
+        for ligne in session.execute(
+            select(*[getattr(CardPrice, col) for col in CLE_PRIX]).where(
+                CardPrice.printing_id.in_({r["printing_id"] for r in rows}),
+                CardPrice.date == rows[0]["date"],
+                CardPrice.source == rows[0]["source"],
+            )
+        )
+    }
+    a_inserer = [r for r in rows if tuple(r[col] for col in CLE_PRIX) not in deja]
+    if not a_inserer:
+        return
+
+    # `DO NOTHING` conservé comme filet : deux runs concurrents pourraient avoir
+    # lu le même état avant que l'un des deux n'écrive.
+    session.execute(
+        pg_insert(CardPrice).values(a_inserer).on_conflict_do_nothing()
+    )
 
 
 def propagate_cardmarket_ids(session: Session) -> int:
