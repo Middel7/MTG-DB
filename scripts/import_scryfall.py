@@ -604,13 +604,25 @@ def _flush_batch(
     raw_cards: list[dict[str, Any]],
     today: date,
 ) -> tuple[int, int]:
-    seen: dict[str, int] = {}
+    # Deux déduplications de natures DIFFÉRENTES. Les confondre a coûté 4 % du
+    # catalogue à chaque run.
+    #
+    # `card_rows` porte des CARTES (niveau oracle). `ON CONFLICT DO UPDATE` ne
+    # peut pas affecter deux fois la même ligne dans un seul INSERT : il faut
+    # donc un seul enregistrement par `oracle_id`.
+    #
+    # `raw_cards` porte des IMPRESSIONS, et le bulk en compte plusieurs par carte
+    # — une par langue, par variante. Leur appliquer la déduplication des cartes
+    # revenait à jeter toutes les impressions d'un même `oracle_id` sauf une :
+    # 22 037 lignes écartées sur les 542 827 du bulk du 19/09, sans aucune trace,
+    # puisque le compteur affiché était celui des survivantes. Le symptôme visible
+    # était `cards_imported == printings_imported` dans chaque run.
+    seen_oracle: dict[str, int] = {}
     for i, row in enumerate(card_rows):
-        seen[row["oracle_id"]] = i
-    dedup_idx = sorted(seen.values())
-    card_rows = [card_rows[i] for i in dedup_idx]
-    raw_cards = [raw_cards[i] for i in dedup_idx]
+        seen_oracle[row["oracle_id"]] = i
+    card_rows = [card_rows[i] for i in sorted(seen_oracle.values())]
 
+    # Une impression ne se déduplique que sur sa propre identité.
     seen_sid: dict[str, int] = {}
     for i, raw in enumerate(raw_cards):
         seen_sid[raw["id"]] = i
@@ -618,9 +630,8 @@ def _flush_batch(
 
     oracle_to_id = _upsert_cards(session, card_rows)
 
-    face_rows: list[dict] = []
     printing_rows: list[dict] = []
-    card_ids_with_faces: list[int] = []
+    faces_par_carte: dict[int, list[dict]] = {}
     raw_prices: dict[str, dict] = {}
 
     for raw in raw_cards:
@@ -628,15 +639,20 @@ def _flush_batch(
         card_id = oracle_to_id.get(oracle_id)
         if card_id is None:
             continue
-        faces = _parse_face_rows(raw, card_id)
-        if faces:
-            face_rows.extend(faces)
-            card_ids_with_faces.append(card_id)
+        # Les faces appartiennent à la CARTE, pas à l'impression. Depuis que
+        # plusieurs impressions d'une même carte cohabitent dans un lot, les
+        # parser à chaque fois ferait insérer les mêmes faces autant de fois :
+        # `scryfall_card_faces` n'a aucune contrainte d'unicité pour l'empêcher.
+        if card_id not in faces_par_carte:
+            faces = _parse_face_rows(raw, card_id)
+            if faces:
+                faces_par_carte[card_id] = faces
         printing_rows.append(_parse_printing_row(raw, card_id))
         raw_prices[raw["id"]] = raw.get("prices") or {}
 
-    if card_ids_with_faces:
-        _replace_faces(session, face_rows, card_ids_with_faces)
+    if faces_par_carte:
+        face_rows = [ligne for faces in faces_par_carte.values() for ligne in faces]
+        _replace_faces(session, face_rows, list(faces_par_carte))
 
     scryfall_to_printing_id = _upsert_printings(session, printing_rows)
 
@@ -871,6 +887,15 @@ def main() -> None:
                 log.info(f"  Erreurs         : {errors_n:>10}")
                 log.info(f"  Durée           : {elapsed:>9}s")
                 log.info("=" * 47)
+
+                # Un run 'partial' doit SORTIR en echec. Le marquer en base ne
+                # suffisait pas : le processus rendait 0, `update_all.py` affichait
+                # « OK » et la tache planifiee remontait LastTaskResult=0. Un run
+                # ayant perdu 300 000 cartes produisait donc exactement le meme
+                # signal d'exploitation qu'un run parfait, et la seule trace etait
+                # une ligne en base que rien n'interrogeait automatiquement.
+                if errors_n:
+                    sys.exit(1)
 
             except Exception as exc:
                 elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())

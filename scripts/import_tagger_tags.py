@@ -16,8 +16,19 @@ Usage :
 
 Notes :
   - L'API GraphQL du Tagger est non officielle et peut changer sans préavis.
-  - En cas d'erreur HTTP, le script continue et log les échecs.
   - Le token CSRF est rafraîchi toutes les 200 requêtes ou sur erreur d'authentification.
+
+Codes de sortie :
+  0  l'import s'est déroulé normalement
+  1  Tagger est trop souvent indisponible (voir SEUIL_ECHEC) ou la base est
+     injoignable
+
+Une carte que Tagger ne connaît pas n'est PAS une erreur : c'est une réponse
+valide, et elle ne compte pas dans le seuil. Seules les pannes de transport
+(timeout, HTTP 5xx, 429 répétés) comptent. Confondre les deux était le défaut
+d'origine : `graphql_request()` retournait `None` dans les deux cas, le compteur
+d'erreurs restait donc à zéro même quand 100 % des requêtes échouaient, et le
+script sortait en succès après 40 minutes de travail perdu.
 """
 from __future__ import annotations
 
@@ -39,13 +50,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.db.engine import SessionLocal, check_connection
-from mtgdb.db.models.card import Card
 from mtgdb.db.models.card_tag import CardTag
-from mtgdb.db.models.card_printing import CardPrinting
+from mtgdb.db.runs import finaliser_run, marquer_runs_orphelins, ouvrir_run
 
 TAGGER_BASE = "https://tagger.scryfall.com"
 GRAPHQL_URL = f"{TAGGER_BASE}/graphql"
 CSRF_REFRESH_EVERY = 200
+
+# Valeur de `import_runs.source` pour cette étape. Figée : c'est la clé sur
+# laquelle la supervision interroge la fraîcheur des tags.
+SOURCE = "tagger"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,8 +110,15 @@ def graphql_request(
     collector_number: str,
 ) -> Optional[list[str]]:
     """
-    Appelle l'endpoint GraphQL du Tagger et retourne la liste des ORACLE_CARD_TAG.
-    Retourne None si la carte n'est pas trouvée ou en cas d'erreur.
+    Liste des ORACLE_CARD_TAG de la carte.
+
+    Retourne `None` uniquement quand Tagger répond correctement qu'il ne connaît
+    pas cette carte — c'est un résultat, pas un incident.
+
+    Lève `_TaggerIndisponible` quand la requête n'a pas abouti (timeout, HTTP non
+    200, 429 répétés). Ces deux situations étaient auparavant confondues sous un
+    même `return None`, ce qui rendait une panne totale de Tagger indiscernable
+    d'un catalogue simplement inconnu.
     """
     payload = {
         "operationName": "FetchCard",
@@ -115,9 +136,12 @@ def graphql_request(
     for attempt in range(3):
         try:
             resp = client.post(GRAPHQL_URL, json=payload, headers=headers, timeout=15)
-        except httpx.TimeoutException:
-            log.warning("Timeout pour %s/%s", set_code, collector_number)
-            return None
+        except httpx.TimeoutException as exc:
+            raise _TaggerIndisponible(
+                f"timeout pour {set_code}/{collector_number}") from exc
+        except httpx.HTTPError as exc:
+            raise _TaggerIndisponible(
+                f"erreur de transport pour {set_code}/{collector_number} : {exc}") from exc
 
         if resp.status_code == 429:
             wait = [10, 15, 20][attempt]  # 10s, 15s, 20s
@@ -126,15 +150,20 @@ def graphql_request(
             continue
 
         if resp.status_code != 200:
-            log.warning("HTTP %s pour %s/%s", resp.status_code, set_code, collector_number)
-            return None
+            raise _TaggerIndisponible(
+                f"HTTP {resp.status_code} pour {set_code}/{collector_number}")
 
         break
     else:
-        log.error("Abandon après 3 tentatives (429) pour %s/%s", set_code, collector_number)
-        return None
+        raise _TaggerIndisponible(
+            f"abandon apres 3 tentatives (429) pour {set_code}/{collector_number}")
 
-    body = resp.json()
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        # Une page d'erreur HTML servie en 200 : Tagger est en panne, pas la carte.
+        raise _TaggerIndisponible(
+            f"reponse illisible pour {set_code}/{collector_number}") from exc
 
     # Token invalide → signal pour rafraîchir
     if not body.get("data") and body.get("message") == "invalid authenticity token":
@@ -152,7 +181,19 @@ def graphql_request(
 
 
 class _CsrfExpired(Exception):
-    pass
+    """Le token CSRF n'est plus accepté : il faut en redemander un."""
+
+
+class _TaggerIndisponible(Exception):
+    """La requête n'a pas abouti. À distinguer d'une carte que Tagger ne connaît pas."""
+
+
+# Part maximale de requêtes en échec au-delà de laquelle le run est déclaré
+# raté. 20 % : Tagger renvoie ponctuellement des 5xx isolés sur un catalogue de
+# plusieurs milliers de cartes, et faire échouer un run pour trois timeouts
+# apprendrait surtout à ignorer l'alerte. En revanche, au-delà d'une requête sur
+# cinq, ce n'est plus du bruit — c'est une panne, et le run doit le dire.
+SEUIL_ECHEC = 0.20
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,23 +282,43 @@ def main() -> None:
         log.error("Impossible de se connecter à la base de données.")
         sys.exit(1)
 
+    total_tags = 0
+    errors = 0
+    cartes_traitees = 0
+
     with SessionLocal() as session:
+        orphelins = marquer_runs_orphelins(session, source=SOURCE)
+        if orphelins:
+            log.warning("%d run(s) tagger reste(s) 'running' marque(s) 'failed'.", orphelins)
+
         log.info("Récupération des cartes à traiter...")
         cards = fetch_cards_to_process(session, only_missing=only_missing, limit=args.limit)
 
         if not cards:
+            # Tracé quand même : « aucune carte à traiter » est un résultat
+            # normal (tout est déjà tagué), et il doit être distinguable d'un run
+            # qui n'a jamais eu lieu.
             log.info("Aucune carte à traiter.")
+            run_id = ouvrir_run(session, SOURCE)
+            finaliser_run(SessionLocal, run_id, "success")
             return
 
         mode = "toutes les cartes" if args.process_all else "cartes sans tags"
         log.info("%d cartes à traiter (%s).", len(cards), mode)
 
+        run_id = ouvrir_run(session, SOURCE, source_file=GRAPHQL_URL)
+        log.info("Import run #%d démarré.", run_id)
+
         with httpx.Client(cookies={}) as client:
-            csrf_token = refresh_session(client)
+            try:
+                csrf_token = refresh_session(client)
+            except Exception as exc:
+                finaliser_run(SessionLocal, run_id, "failed",
+                              error_message=f"session Tagger impossible : {exc}"[:2000])
+                log.error("Session Tagger impossible : %s", exc)
+                sys.exit(1)
             log.info("Session Tagger initialisée.")
 
-            total_tags = 0
-            errors = 0
             request_count = 0
             commit_batch: list[tuple[int, list[str]]] = []
 
@@ -283,12 +344,17 @@ def main() -> None:
                             log.warning("Échec après rafraîchissement CSRF pour %s : %s", card_name, e)
                             errors += 1
                             continue
+                    except _TaggerIndisponible as e:
+                        log.warning("Tagger indisponible pour %s : %s", card_name, e)
+                        errors += 1
+                        continue
                     except Exception as e:
                         log.warning("Erreur pour %s (%s/%s) : %s", card_name, set_code, collector_number, e)
                         errors += 1
                         continue
 
                     request_count += 1
+                    cartes_traitees += 1
 
                     if tag_names is not None:
                         commit_batch.append((card_id, tag_names))
@@ -309,7 +375,28 @@ def main() -> None:
                     upsert_tags(session, cid, tags, replace=args.process_all)
                 session.commit()
 
-    log.info("Terminé. %d tags importés, %d erreurs.", total_tags, errors)
+    tentatives = cartes_traitees + errors
+    taux = errors / tentatives if tentatives else 0.0
+    log.info("Terminé. %d tags importés, %d erreurs sur %d requête(s) (%.1f %%).",
+             total_tags, errors, tentatives, taux * 100)
+
+    en_echec = taux > SEUIL_ECHEC
+    finaliser_run(
+        SessionLocal, run_id,
+        "failed" if en_echec else ("partial" if errors else "success"),
+        cards=cartes_traitees,
+        printings=total_tags,
+        errors=errors,
+        error_message=(
+            f"{errors} echec(s) de transport sur {tentatives} requete(s) "
+            f"({taux:.1%}) — Tagger indisponible ?" if errors else None),
+    )
+
+    if en_echec:
+        log.error(
+            "Plus de %.0f %% des requetes ont echoue : Tagger est probablement "
+            "indisponible ou son API a change. Run marque 'failed'.", SEUIL_ECHEC * 100)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

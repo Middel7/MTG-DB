@@ -4,6 +4,8 @@ Revision ID: 20260609_refactor_translations
 Revises: 20260609_card_translations
 Create Date: 2026-06-09
 """
+import os
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -11,6 +13,19 @@ revision = "20260609_refactor_translations"
 down_revision = "20260609_card_translations"
 branch_labels = None
 depends_on = None
+
+_ECHAPPATOIRE = "MTGDB_ALLOW_DESTRUCTIVE_DOWNGRADE"
+
+
+def _refuser_sauf_demande_explicite(degat: str) -> None:
+    """Bloque un downgrade qui détruirait des données non reconstituables sur place."""
+    if os.getenv(_ECHAPPATOIRE, "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    raise RuntimeError(
+        f"Downgrade REFUSÉ : {degat}\n"
+        f"Préférez corriger par une migration `upgrade`.\n"
+        f"Si vous savez ce que vous faites : {_ECHAPPATOIRE}=1 alembic downgrade …"
+    )
 
 
 def upgrade() -> None:
@@ -24,6 +39,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _refuser_sauf_demande_explicite(
+        "la colonne card_printings.printed_name serait SUPPRIMÉE avec son "
+        "contenu (539 629 lignes au 19/09/2026). Elle n'est reconstituable que "
+        "par un réimport complet du bulk Scryfall, et c'est la colonne sur "
+        "laquelle repose toute la recherche multilingue de RELIC-Trade."
+    )
     op.create_table(
         "card_translations",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),

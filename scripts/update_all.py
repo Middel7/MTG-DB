@@ -40,6 +40,7 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -122,6 +123,48 @@ class Output:
         if self._fh:
             self._fh.close()
             self._fh = None
+
+
+class _JournalHandler(logging.Handler):
+    """
+    Route les messages des modules de la bibliothèque vers l'`Output` du run.
+
+    Sans cela, `mtgdb.db.lock` et `mtgdb.db.retry` n'ont aucun handler : Python
+    retombe sur `logging.lastResort`, qui écrit sur stderr, sans horodatage, et
+    surtout HORS du fichier de journal — `Output` ne capte que la sortie des
+    sous-processus, jamais celle du processus parent.
+
+    Les trois messages ainsi perdus étaient les plus importants du système :
+    perte de la connexion porteuse du verrou, reprise, et surtout
+    « Verrou perdu ET repris par un autre run » — l'annonce que deux runs
+    écrivent peut-être en parallèle.
+    """
+
+    def __init__(self, out: "Output"):
+        super().__init__()
+        self._out = out
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+        except Exception:  # noqa: BLE001 — un handler ne doit jamais tuer le run
+            return
+        couleur = {"WARNING": "yellow", "ERROR": "red", "CRITICAL": "red"}.get(record.levelname)
+        self._out.line(message, couleur)
+
+
+def configurer_journalisation(out: Output) -> None:
+    """Branche le logging de la bibliothèque sur le journal du run."""
+    handler = _JournalHandler(out)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    racine = logging.getLogger()
+    racine.setLevel(logging.INFO)
+    # `force`-like : on repart d'une ardoise nette pour ne pas doubler l'affichage
+    # si la fonction est appelée deux fois (tests).
+    for ancien in list(racine.handlers):
+        racine.removeHandler(ancien)
+    racine.addHandler(handler)
 
 
 def rotate_logs(log_dir: Path, keep: int = LOG_RETENTION) -> None:
@@ -348,6 +391,7 @@ def main() -> None:
         log_path = LOG_DIR / f"update_{stamp}.log"
 
     out = Output(log_path)
+    configurer_journalisation(out)
     steps = select_steps(cli)
     total = len(steps)
 

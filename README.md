@@ -217,7 +217,7 @@ Schéma complet, relations et notes détaillées :
 alembic current                               # révision courante
 alembic upgrade head                          # appliquer les migrations
 alembic revision --autogenerate -m "message"  # générer une migration
-alembic downgrade -1                          # revenir en arrière d'une révision
+alembic downgrade -1                          # ⚠️ PAS un rollback : voir docs/migrations.md
 ```
 
 > ⚠️ **La base `manamind` est partagée avec d'autres projets** (ManaMind_AI, mtgtrade),
