@@ -5,6 +5,87 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [Non publié] — 2026-09-19 (7) — Les upserts ne brûlent plus d'identifiants
+
+Branche `perf/consommation-sequences`. Point soulevé par les audits croisés de
+ManaMind_AI et de RELIC-Trade, confirmé ici.
+
+### Le défaut
+
+`INSERT … ON CONFLICT` consomme une valeur de séquence pour chaque ligne
+**proposée**, y compris celles qui finissent en `UPDATE` ou qui ne font rien :
+`nextval()` est évalué à la construction de la ligne candidate, bien avant que le
+conflit ne soit détecté, et rien ne la rend ensuite.
+
+| Séquence | Valeur | Lignes | Ratio | Insertions réelles |
+|---|---|---|---|---|
+| `cards_id_seq` | 39 840 157 | 38 907 | **1024×** | 544 |
+| `card_printings_id_seq` | 40 830 218 | 542 876 | **75×** | 14 696 |
+| `card_faces_id_seq` | 1 868 018 | 6 459 | 289× | — |
+| `mtg_sets_id_seq` | 85 887 | 1 052 | 82× | ~1/mois |
+
+Même constat sur `relictrade` : 655× et 47×, avec **91 insertions pour 922 554
+updates**. Les colonnes `id` sont des `integer` : c'était ce gaspillage, et non la
+croissance des données, qui fixait l'échéance d'épuisement du plafond.
+
+### Le correctif
+
+Les quatre écritures séparent l'existant du nouveau : un `SELECT` de la clé
+métier par lot, un `INSERT` des seules nouvelles, puis un `UPDATE … FROM
+(VALUES …)` pour le reste — qui ne consomme aucun identifiant.
+
+> `INSERT … SELECT … WHERE NOT EXISTS` **ne suffirait pas** : le `DEFAULT
+> nextval()` s'évalue à la projection du `SELECT`, avant le filtre. Il faut ne pas
+> proposer la ligne du tout.
+
+### Mesuré sur un run complet
+
+| | Avant | Après |
+|---|---|---|
+| `cards_id_seq` | +520 790 | **+0** |
+| `card_printings_id_seq` | +520 790 | **+0** |
+| `UPDATE` sur les deux tables | ~520 790 | **+0** |
+| Impressions traitées | 542 827 | 542 827 |
+| Erreurs | 0 | 0 |
+
+Un run qui ne trouve rien de nouveau n'écrit plus rien.
+
+### Deux défauts que seul un vrai run pouvait montrer
+
+1. `values()` avec un dict positionnel **et** un kwarg : refusé par SQLAlchemy.
+2. `operator does not exist: integer = text`. Déclarer le type d'une colonne ne
+   suffit pas à typer le SQL émis — SQLAlchemy n'ajoute un `::type` que pour
+   certains types. Quand toutes les valeurs d'une colonne du lot valent `NULL`
+   (`edhrec_rank`, `printed_name`, `cardmarket_id` le sont couramment),
+   PostgreSQL la type en `text`. Corrigé par un `CAST` explicite.
+
+Le second a coûté **117 327 cartes perdues** sur un run de contrôle — et le
+mécanisme ajouté en livraison (4) l'a signalé : statut `partial`, code 1. Sans
+lui, ces pertes seraient passées pour un succès.
+
+### Surveillance
+
+`mtgdb.db.sequences`, journalisé en fin de run. Une régression serait autrement
+invisible : tout continuerait de fonctionner, et le problème ne se manifesterait
+que le jour où une séquence bute et bloque toute insertion.
+
+La séquence est reliée à sa colonne par `pg_depend`, non par comparaison de noms :
+un `LIKE '%' || sequencename || '%'` apparie à tort, `cards_id_seq` étant contenu
+dans `deck_cards_id_seq`. Le filtre sur les colonnes `integer` écarte au passage
+`deck_cards_id_seq` — la plus avancée de la base (124 289 334, 5,79 % du plafond)
+mais dont la colonne est **déjà un `bigint`**.
+
+### Migration `bigint` : documentée, pas nécessaire
+
+[`docs/migration_bigint.md`](docs/migration_bigint.md). Chronométrée en
+transaction annulée : **93,6 s** en local pour les six colonnes et les deux vues.
+Trois pièges y sont consignés, tous découverts en mesurant — deux vues bloquantes
+dont une vue matérialisée qui n'appartient pas à ce dépôt, le périmètre imposé par
+les clés étrangères, et le fait qu'un `serial` exige un `ALTER SEQUENCE … AS
+bigint` séparé.
+
+---
+
 ## [Non publié] — 2026-09-19 (6) — Suites d'audit : performance et dette
 
 Branche `perf/p2-upsert`.
