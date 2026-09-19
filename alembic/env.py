@@ -55,6 +55,9 @@ VERSION_TABLE = "mtgdb_alembic_version"
 # modèles ignorent : sans cette exclusion, l'autogenerate proposerait de les supprimer.
 # Les modèles restent utilisables en lecture — ils sortent seulement du périmètre des
 # migrations de ce dépôt.
+# Ces deux tables ont été créées par MTG-DB (migration 20260620) avant de passer
+# sous la responsabilité de ManaMind_AI. La migration explique cette histoire ;
+# ne pas la « corriger » en retirant les tables d'ici.
 FOREIGN_TABLES = {"deck_stat_global", "deck_stat_commander"}
 
 

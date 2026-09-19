@@ -13,17 +13,13 @@ qu'il faut verrouiller.
 """
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql import func
 
 from mtgdb.db.models.card_printing import CardPrinting
-
-ROOT = Path(__file__).resolve().parents[1]
+from mtgdb.scryfall import upserts
 
 UPDATE_COLS = [
     "oracle_id", "card_id", "set_code", "collector_number", "lang",
@@ -35,16 +31,7 @@ UPDATE_COLS = [
 
 
 @pytest.fixture(scope="module")
-def import_scryfall():
-    spec = importlib.util.spec_from_file_location(
-        "import_scryfall_upsert", ROOT / "scripts" / "import_scryfall.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope="module")
-def sql_du_upsert(import_scryfall):
+def sql_du_upsert():
     """Reproduit la clause construite par `_upsert_printings`, et la compile."""
     stmt = pg_insert(CardPrinting).values([{"scryfall_id": "00000000-0000-0000-0000-000000000000"}])
     stmt = stmt.on_conflict_do_update(
@@ -52,7 +39,7 @@ def sql_du_upsert(import_scryfall):
         set_={
             col: (
                 func.coalesce(getattr(stmt.excluded, col), getattr(CardPrinting, col))
-                if col in import_scryfall.PRESERVE_IF_NULL
+                if col in upserts.PRESERVE_IF_NULL
                 else getattr(stmt.excluded, col)
             )
             for col in UPDATE_COLS
@@ -80,17 +67,17 @@ def test_les_autres_colonnes_suivent_bien_le_bulk(sql_du_upsert, colonne):
     assert f"coalesce(excluded.{colonne}" not in sql_du_upsert
 
 
-def test_la_liste_des_colonnes_preservees_reste_minimale(import_scryfall):
+def test_la_liste_des_colonnes_preservees_reste_minimale():
     # Garde-fou : chaque ajout ici rend une donnée non corrigeable par le bulk.
     # Ce test force à relire le commentaire du module avant d'en ajouter une.
-    assert import_scryfall.PRESERVE_IF_NULL == frozenset({"cardmarket_id"})
+    assert upserts.PRESERVE_IF_NULL == frozenset({"cardmarket_id"})
 
 
-def test_la_propagation_reste_en_place(import_scryfall):
+def test_la_propagation_reste_en_place():
     """
     Le correctif ne rend pas la propagation inutile : elle sert toujours aux
     impressions NOUVELLES, dont la version anglaise porte un cardmarket_id que
     les autres langues n'ont pas encore. Elle devient simplement peu coûteuse,
     puisqu'elle ne trouve plus que ces cas-là.
     """
-    assert hasattr(import_scryfall, "propagate_cardmarket_ids")
+    assert hasattr(upserts, "propagate_cardmarket_ids")

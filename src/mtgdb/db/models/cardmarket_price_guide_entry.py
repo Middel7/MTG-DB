@@ -26,11 +26,16 @@ if TYPE_CHECKING:
 class CardmarketPriceGuideEntry(Base):
     __tablename__ = "cardmarket_price_guide_entries"
 
+    # Pas d'index simple sur `id_product` : le composite ci-dessous le couvre par
+    # son préfixe gauche, y compris pour la clé étrangère. Mesuré sur 6 320 513
+    # lignes, la même recherche passe de 0,660 ms (index simple) à 0,098 ms
+    # (composite) — ses pages sont déjà en cache, puisque c'est lui que servent
+    # toutes les autres requêtes. Retiré par 20260919_drop_idx_redondant, qui
+    # explique la mesure.
     __table_args__ = (
         UniqueConstraint(
             "import_file_id", "id_product", name="uq_cm_price_guide_import_product"
         ),
-        Index("ix_cm_price_guide_id_product", "id_product"),
         Index("ix_cm_price_guide_captured_at", "captured_at"),
         Index("ix_cm_price_guide_product_captured", "id_product", "captured_at"),
     )

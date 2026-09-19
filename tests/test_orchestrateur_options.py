@@ -101,3 +101,53 @@ def test_l_ordre_canonique_place_scryfall_en_premier(update_all):
     """
     assert update_all.STEPS[0][0] == "scryfall"
     assert _cles(update_all.STEPS).index("cardmarket") > _cles(update_all.STEPS).index("scryfall")
+
+
+# ── Délai maximal par étape ───────────────────────────────────────────────────
+
+def test_chaque_etape_porte_un_delai_maximal(update_all):
+    """
+    Sans délai, une étape bloquée bloque l'orchestrateur indéfiniment.
+
+    Les deux filets qui existaient — 3 h côté Planificateur Windows, 12 h côté
+    Render — sont EXTÉRIEURS au programme : ils ne s'appliquent pas à un run
+    lancé à la main, et tuent la tâche sans laisser de trace exploitable.
+    """
+    for cle, _libelle, _script, _args, delai in update_all.STEPS:
+        assert isinstance(delai, (int, float)), cle
+        assert delai > 0, cle
+
+
+def test_les_delais_laissent_de_la_marge_sur_les_durees_mesurees(update_all):
+    """
+    Un délai trop serré est pire que pas de délai : il tue des runs sains.
+
+    Repères mesurés en production : 84 min pour Scryfall, ~10 min pour
+    Cardmarket, ~40 min pour les tags. Chaque plafond doit rester nettement
+    au-dessus.
+    """
+    plafonds = {cle: delai for cle, _l, _s, _a, delai in update_all.STEPS}
+    assert plafonds["scryfall"] >= 3 * 3600, "84 min mesurées en production"
+    assert plafonds["cardmarket"] >= 3600
+    assert plafonds["tags"] >= 2 * 3600, "~40 min, et 0,2 s de pause par carte"
+    assert plafonds["game-changers"] >= 300
+
+
+def test_un_depassement_est_rapporte_comme_un_echec(update_all, tmp_path):
+    """
+    Et non comme un succès.
+
+    Un processus qu'on vient de tuer peut rendre n'importe quel code ; c'est
+    l'orchestrateur qui décide, pas lui.
+    """
+    import sys
+
+    sortie = update_all.Output(None)
+    code = update_all._stream_subprocess(
+        # Un processus qui ne rend jamais la main.
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        env=dict(__import__("os").environ),
+        out=sortie,
+        timeout=1.0,
+    )
+    assert code == 1, "un dépassement doit valoir échec"

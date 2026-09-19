@@ -1,5 +1,23 @@
 """Ajoute les tables deck_stat_global et deck_stat_commander
 
+⚠️ CONTRADICTION APPARENTE AVEC alembic/env.py, ET ELLE EST VOULUE
+
+Cette migration CRÉE ces deux tables, alors qu'`env.py` les liste dans
+`FOREIGN_TABLES`, c'est-à-dire « appartenant à ManaMind_AI ». Les deux
+affirmations sont vraies, mais à deux moments différents :
+
+  20/06/2026  MTG-DB crée les tables et les alimente ;
+  13/07/2026  ManaMind_AI en devient propriétaire — il y ajoute ses propres
+              colonnes (tfidf, idf, tfidf_norm) et les recalcule par son script
+              `compute_deck_stats.py`, qui ne fait pas partie de ce dépôt.
+
+Depuis, MTG-DB n'en expose que des modèles EN LECTURE. Les exclure de
+l'autogenerate évite qu'il ne propose de supprimer les colonnes de ManaMind_AI
+à chaque génération.
+
+Ne pas « corriger » l'incohérence en retirant ces tables de `FOREIGN_TABLES` :
+c'est le filtre qui protège, pas la migration qui fait foi.
+
 Revision ID: 20260620_add_deck_stats_tables
 Revises: 20260620_add_scryfall_card_tags
 Create Date: 2026-06-20

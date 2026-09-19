@@ -163,23 +163,33 @@ MTG-DB/
 ├─ Dockerfile                  # Image "updater" (one-shot) — celle que Render exécute
 ├─ docker-compose.yml          # Service updater, usage local
 ├─ CHANGELOG.md
+├─ .github/workflows/ci.yml    # Lint, tests, migrations sur base vierge
 ├─ scripts/
 │  ├─ update_all.py            # ★ Orchestrateur (les 4 sources)
 │  ├─ install_scheduled_tasks.ps1  # Tâches planifiées Windows (base locale)
-│  ├─ import_scryfall.py       # Import Scryfall
+│  ├─ import_scryfall.py       # Point d'entrée Scryfall (le traitement est dans src/)
 │  ├─ import_cardmarket_all.py # Import Cardmarket complet
 │  ├─ import_cardmarket_products.py
 │  ├─ import_cardmarket_price_guide.py
 │  ├─ link_cardmarket_to_scryfall.py
+│  ├─ reparer_prix_orphelins.py # Maintenance : rattache les prix sans produit
 │  ├─ import_game_changers.py  # Flag game_changer
 │  └─ import_tagger_tags.py    # Tags oracle Scryfall Tagger
 ├─ src/mtgdb/
 │  ├─ runtime.py               # Détection conteneur (journal, garde-fous)
+│  ├─ rawfiles.py              # Purge des fichiers bruts téléchargés
 │  ├─ db/
 │  │  ├─ engine.py             # Connexion + garde-fou "pas de base locale"
 │  │  ├─ urls.py               # Normalisation postgres:// → postgresql://
 │  │  ├─ lock.py               # Verrou anti-chevauchement (pg_advisory_lock)
+│  │  ├─ retry.py              # Réessai sur coupure transitoire de la base
+│  │  ├─ runs.py               # Traçabilité des imports (import_runs)
 │  │  └─ models/               # modèles SQLAlchemy
+│  ├─ scryfall/                # ★ Le pipeline Scryfall
+│  │  ├─ parsers.py            #   le JSON, et rien d'autre — fonctions pures
+│  │  ├─ upserts.py            #   PostgreSQL, une Session en paramètre
+│  │  ├─ bulk.py               #   le réseau : métadonnées, téléchargement
+│  │  └─ pipeline.py           #   l'enchaînement : lots, cache, comptage
 │  └─ cardmarket/              # téléchargement + parsers + import Cardmarket
 ├─ tests/                      # pytest ; les tests `integration` demandent une base
 ├─ alembic/                    # migrations

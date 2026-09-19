@@ -9,7 +9,16 @@ import unicodedata
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -38,6 +47,16 @@ def normalize_card_name(name: str) -> str:
 class Card(Base):
     __tablename__ = "scryfall_cards"
 
+    # Index PARTIEL : la sélection des cartes à taguer ne s'intéresse qu'à celles
+    # déjà vérifiées, pour les écarter. Les NULL n'ont rien à faire dans l'index.
+    __table_args__ = (
+        Index(
+            "ix_scryfall_cards_tagger_checked_at",
+            "tagger_checked_at",
+            postgresql_where=text("tagger_checked_at IS NOT NULL"),
+        ),
+    )
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     oracle_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
@@ -57,6 +76,13 @@ class Card(Base):
     edhrec_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     game_changer: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, server_default="false", index=True
+    )
+    # Date du dernier passage de Scryfall Tagger sur cette carte, qu'il ait produit
+    # des tags ou non. Sans elle, une carte que Tagger connaît mais n'a taguée avec
+    # rien reste « sans tag » et se voit réinterrogée à chaque run hebdomadaire,
+    # indéfiniment — une requête HTTP et 0,2 s de pause à chaque fois.
+    tagger_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

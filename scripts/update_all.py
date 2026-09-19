@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -76,12 +78,24 @@ from mtgdb.runtime import in_container  # noqa: E402
 
 LOG_RETENTION = 30  # nombre de fichiers de log conservés
 
-# Ordre canonique des étapes. Chaque entrée : (clé, libellé, script, args de base)
+# Ordre canonique des étapes. Chaque entrée :
+#   (clé, libellé, script, args de base, délai maximal en secondes)
+#
+# Les délais sont larges — trois à quatre fois la durée mesurée en production,
+# elle-même dix fois celle du poste. Ils ne servent pas à cadencer le travail
+# mais à empêcher un blocage indéfini : une étape qui les dépasse ne progresse
+# plus, elle attend quelque chose qui ne viendra pas.
+#
+#   scryfall       84 min mesurées en prod (upsert des impressions)
+#   cardmarket     ~10 min en prod
+#   game-changers  quelques secondes ; une minute suffirait, on laisse 15 min
+#   tags           ~40 min en local, et le script dort 0,2 s entre deux cartes
 STEPS = [
-    ("scryfall", "Scryfall (cartes, éditions, prix)", "import_scryfall.py", []),
-    ("cardmarket", "Cardmarket (produits + prix + liaison)", "import_cardmarket_all.py", []),
-    ("game-changers", "Game Changers (flag game_changer)", "import_game_changers.py", []),
-    ("tags", "Tags Tagger (cartes sans tags)", "import_tagger_tags.py", []),
+    ("scryfall", "Scryfall (cartes, éditions, prix)", "import_scryfall.py", [], 4 * 3600),
+    ("cardmarket", "Cardmarket (produits + prix + liaison)",
+     "import_cardmarket_all.py", [], 2 * 3600),
+    ("game-changers", "Game Changers (flag game_changer)", "import_game_changers.py", [], 900),
+    ("tags", "Tags Tagger (cartes sans tags)", "import_tagger_tags.py", [], 4 * 3600),
 ]
 
 _C = {
@@ -205,7 +219,7 @@ def build_step_args(key: str, cli: argparse.Namespace) -> list[str]:
     return extra
 
 
-def run_step(key: str, label: str, script: str, base_args: list[str],
+def run_step(key: str, label: str, script: str, base_args: list[str], timeout: float,
              cli: argparse.Namespace, index: int, total: int, out: Output) -> dict:
     args = base_args + build_step_args(key, cli)
     cmd = [PYTHON, str(SCRIPTS / script), *args]
@@ -232,7 +246,7 @@ def run_step(key: str, label: str, script: str, base_args: list[str],
     if DATABASE_URL:
         env["DATABASE_URL"] = DATABASE_URL
 
-    returncode = _stream_subprocess(cmd, env, out)
+    returncode = _stream_subprocess(cmd, env, out, timeout=timeout)
     duration = time.monotonic() - start
 
     ok = returncode == 0
@@ -247,7 +261,8 @@ def run_step(key: str, label: str, script: str, base_args: list[str],
     }
 
 
-def _stream_subprocess(cmd: list[str], env: dict, out: Output) -> int:
+def _stream_subprocess(cmd: list[str], env: dict, out: Output,
+                       timeout: float | None = None) -> int:
     """
     Lance le sous-processus en relayant sa sortie vers la console ET le fichier de log.
 
@@ -255,6 +270,22 @@ def _stream_subprocess(cmd: list[str], env: dict, out: Output) -> int:
     les laisse telles quelles sur la console, mais le fichier de log ne conserve que
     l'état final de chaque ligne — sinon un run de 40 min produirait un log de
     plusieurs dizaines de milliers de lignes de barres intermédiaires.
+
+    `timeout` borne la durée TOTALE de l'étape. Sans lui, une étape bloquée — un
+    socket Tagger figé, une requête PostgreSQL suspendue — bloque l'orchestrateur
+    indéfiniment. Deux filets existaient, mais tous deux EXTÉRIEURS au programme :
+    la limite de 3 h du Planificateur Windows et la coupure à 12 h de Render. Ni
+    l'un ni l'autre ne s'applique à un run lancé à la main, et aucun ne laisse de
+    trace exploitable — la tâche est simplement tuée.
+
+    POURQUOI UN THREAD LECTEUR
+    `proc.stdout.read()` est BLOQUANT : tant que l'étape n'écrit rien, on n'en
+    sort pas, et l'échéance n'est jamais examinée. Un délai posé dans cette boucle
+    ne se déclencherait donc que sur un processus bavard — jamais sur un processus
+    figé, c'est-à-dire précisément le cas qu'il vise. `select()` réglerait cela
+    sous Unix, mais ne fonctionne pas sur les pipes Windows, la plateforme de
+    développement de ce dépôt. Un thread qui lit et dépose dans une file laisse la
+    boucle principale libre de compter le temps.
     """
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), env=env,
@@ -263,12 +294,44 @@ def _stream_subprocess(cmd: list[str], env: dict, out: Output) -> int:
     )
     assert proc.stdout is not None
 
+    fragments: queue.Queue[bytes | None] = queue.Queue()
+
+    def lire() -> None:
+        try:
+            while True:
+                morceau = proc.stdout.read(4096)
+                if not morceau:
+                    break
+                fragments.put(morceau)
+        except Exception:  # noqa: BLE001 — le pipe se ferme quand on tue le processus
+            pass
+        finally:
+            fragments.put(None)  # sentinelle de fin
+
+    lecteur = threading.Thread(target=lire, name="mtgdb-lecteur-etape", daemon=True)
+    lecteur.start()
+
+    echeance = None if timeout is None else time.monotonic() + timeout
+    depasse = False
     pending = ""
     while True:
-        chunk = proc.stdout.read(4096)
-        if not chunk:
+        if echeance is not None and time.monotonic() > echeance:
+            depasse = True
+            out.line(f"\n  ⏱ Étape interrompue : plus de {fmt_duration(timeout)} "
+                     f"sans avoir terminé.", "red")
+            _terminer(proc)
             break
-        text = chunk.decode("utf-8", errors="replace")
+
+        try:
+            # Réveil au moins chaque seconde, pour réexaminer l'échéance même
+            # quand l'étape reste muette.
+            morceau = fragments.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if morceau is None:
+            break
+
+        text = morceau.decode("utf-8", errors="replace")
 
         # Console : fidélité totale (les barres tqdm s'animent normalement)
         sys.stdout.write(text)
@@ -281,9 +344,27 @@ def _stream_subprocess(cmd: list[str], env: dict, out: Output) -> int:
             out.write_raw(_clean_line(line) + "\n")
 
     proc.wait()
+    lecteur.join(timeout=5)
     if pending.strip():
         out.write_raw(_clean_line(pending) + "\n")
-    return proc.returncode
+    # Un dépassement doit se voir comme un échec, quel que soit le code rendu par
+    # un processus qu'on vient de tuer.
+    return 1 if depasse else proc.returncode
+
+
+def _terminer(proc: subprocess.Popen) -> None:
+    """
+    Arrête le sous-processus, poliment puis fermement.
+
+    `terminate()` d'abord : l'étape peut alors relâcher sa session PostgreSQL
+    proprement. `kill()` seulement si elle ne répond pas — un import tué net
+    laisse son run en `running`, que le run suivant devra marquer orphelin.
+    """
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def _clean_line(line: str) -> str:
@@ -327,8 +408,8 @@ def _run_steps(steps: list[tuple], cli: argparse.Namespace, out: Output) -> list
     """Exécute les étapes dans l'ordre et retourne leurs résultats."""
     results: list[dict] = []
     total = len(steps)
-    for i, (key, label, script, base_args) in enumerate(steps, start=1):
-        res = run_step(key, label, script, base_args, cli, i, total, out)
+    for i, (key, label, script, base_args, timeout) in enumerate(steps, start=1):
+        res = run_step(key, label, script, base_args, timeout, cli, i, total, out)
         results.append(res)
         if res["status"] == "failed" and cli.stop_on_error:
             out.line("\n  --stop-on-error : arrêt après l'échec de cette étape.", "red")

@@ -195,6 +195,13 @@ class _TaggerIndisponible(Exception):
 # cinq, ce n'est plus du bruit — c'est une panne, et le run doit le dire.
 SEUIL_ECHEC = 0.20
 
+# Délai avant de réinterroger une carte pour laquelle Tagger n'a rien produit.
+# 90 jours : Tagger enrichit son catalogue au fil des sorties, mais rarement pour
+# des cartes anciennes qu'il a déjà vues. Plus court ne ferait que réémettre les
+# mêmes requêtes ; beaucoup plus long retarderait la prise en compte des cartes
+# taguées après coup.
+RECONTROLE_JOURS = 90
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SÉLECTION DES CARTES À TRAITER
@@ -204,8 +211,20 @@ def fetch_cards_to_process(session: Session, only_missing: bool,
                            limit: Optional[int]) -> list[tuple[int, str, str, str]]:
     """
     Retourne une liste de (card_id, card_name, set_code, collector_number).
-    Choisit une impression anglaise en priorité, sinon la première disponible.
-    Si only_missing=True, exclut les cartes qui ont déjà au moins un tag.
+
+    Choisit une impression anglaise en priorité, sinon la plus récente.
+
+    Si `only_missing`, écarte deux populations :
+
+      - les cartes qui ont déjà au moins un tag ;
+      - celles vérifiées depuis moins de `RECONTROLE_JOURS`, même si Tagger n'a
+        rien produit pour elles. Sans ce second filtre, une carte que Tagger
+        connaît mais n'a taguée avec rien restait éternellement « sans tag » et
+        se voyait réinterrogée à chaque run — une requête HTTP et 0,2 s de pause,
+        chaque semaine, indéfiniment.
+
+    Le recontrôle reste nécessaire : Tagger enrichit son catalogue en continu.
+    Il devient simplement périodique au lieu d'être systématique.
     """
     # Sous-requête : une impression par carte (anglaise en priorité)
     # On utilise DISTINCT ON (card_id) ordonné par lang='en' DESC
@@ -227,11 +246,29 @@ def fetch_cards_to_process(session: Session, only_missing: bool,
           AND NOT EXISTS (
               SELECT 1 FROM scryfall_card_tags t WHERE t.card_id = c.id
           )
+          AND (c.tagger_checked_at IS NULL
+               OR c.tagger_checked_at < now() - make_interval(days => :jours))
         """ if only_missing else "",
         limit_clause=f"LIMIT {limit}" if limit else "",
     ))
-    rows = session.execute(sql).fetchall()
+    parametres = {"jours": RECONTROLE_JOURS} if only_missing else {}
+    rows = session.execute(sql, parametres).fetchall()
     return [(r.card_id, r.card_name, r.set_code, r.collector_number) for r in rows]
+
+
+def marquer_verifiees(session: Session, card_ids: list[int]) -> None:
+    """
+    Note que Tagger a répondu pour ces cartes, tags ou non.
+
+    C'est cette trace — et non la seule présence de tags — qui permet de ne pas
+    réinterroger indéfiniment une carte que Tagger ne connaît pas.
+    """
+    if not card_ids:
+        return
+    session.execute(
+        text("UPDATE scryfall_cards SET tagger_checked_at = now() WHERE id = ANY(:ids)"),
+        {"ids": card_ids},
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -361,6 +398,9 @@ def main() -> None:
                     cartes_traitees += 1
 
                     if tag_names is not None:
+                        # La carte est enregistrée même sans tag : c'est une
+                        # réponse de Tagger, et c'est ce qui évite de la
+                        # réinterroger à chaque run.
                         commit_batch.append((card_id, tag_names))
                         total_tags += len(tag_names)
 
@@ -368,6 +408,7 @@ def main() -> None:
                     if len(commit_batch) >= 100:
                         for cid, tags in commit_batch:
                             upsert_tags(session, cid, tags, replace=args.process_all)
+                        marquer_verifiees(session, [cid for cid, _ in commit_batch])
                         session.commit()
                         commit_batch.clear()
 
@@ -377,6 +418,7 @@ def main() -> None:
             if commit_batch:
                 for cid, tags in commit_batch:
                     upsert_tags(session, cid, tags, replace=args.process_all)
+                marquer_verifiees(session, [cid for cid, _ in commit_batch])
                 session.commit()
 
     tentatives = cartes_traitees + errors

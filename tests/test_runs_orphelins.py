@@ -6,26 +6,17 @@ Le 19/09, un run de production est mort sans pouvoir écrire son statut : la bas
 est restée `running` indéfiniment. Trois dégâts : la supervision croit un import
 en cours, `bulk_already_imported()` ne voit jamais de succès pour ce bulk, et
 l'historique devient illisible.
+
+Le nettoyage vivait dans `scripts/import_scryfall.py` et ne servait donc qu'à
+Scryfall. Il est désormais dans `mtgdb.db.runs`, partagé par les quatre sources —
+et testable par un import ordinaire, sans charger un script par son chemin.
 """
 from __future__ import annotations
-
-import importlib.util
-from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture(scope="module")
-def import_scryfall():
-    """Charge le script par son chemin : scripts/ n'est pas un paquet importable."""
-    spec = importlib.util.spec_from_file_location(
-        "import_scryfall_sous_test", ROOT / "scripts" / "import_scryfall.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from mtgdb.db.runs import marquer_runs_orphelins
 
 
 @pytest.fixture
@@ -44,7 +35,7 @@ def base_locale(database_url):
 
 
 @pytest.mark.integration
-def test_un_run_interrompu_est_marque_failed(import_scryfall, base_locale):
+def test_un_run_interrompu_est_marque_failed(base_locale):
     engine = create_engine(base_locale)
     from mtgdb.db.engine import SessionLocal
 
@@ -66,7 +57,7 @@ def test_un_run_interrompu_est_marque_failed(import_scryfall, base_locale):
 
     try:
         with SessionLocal() as session:
-            marques = import_scryfall.fail_orphan_runs(session, source="test-orphelin",
+            marques = marquer_runs_orphelins(session, source="test-orphelin",
                                                        older_than_hours=6)
         assert marques == 1, "seul le run trop ancien devait être marqué"
 
@@ -92,7 +83,7 @@ def test_un_run_interrompu_est_marque_failed(import_scryfall, base_locale):
 
 
 @pytest.mark.integration
-def test_un_run_reussi_n_est_jamais_touche(import_scryfall, base_locale):
+def test_un_run_reussi_n_est_jamais_touche(base_locale):
     engine = create_engine(base_locale)
     from mtgdb.db.engine import SessionLocal
 
@@ -106,7 +97,7 @@ def test_un_run_reussi_n_est_jamais_touche(import_scryfall, base_locale):
         """)).scalar()
     try:
         with SessionLocal() as session:
-            import_scryfall.fail_orphan_runs(session, source="test-orphelin", older_than_hours=6)
+            marquer_runs_orphelins(session, source="test-orphelin", older_than_hours=6)
         with engine.connect() as conn:
             statut = conn.execute(text(
                 "SELECT status FROM import_runs WHERE id = :i"), {"i": reussi}).scalar()
