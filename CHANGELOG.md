@@ -5,6 +5,51 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [Non publié] — 2026-09-19 (3) — Le bulk n'efface plus les cardmarket_id
+
+`cardmarket_id` n'est fourni par Scryfall que sur l'impression anglaise.
+L'upsert l'écrasait tel quel, remettant **401 230 impressions non anglaises à
+`NULL` à chaque run** — que `propagate_cardmarket_ids()` repeuplait juste après
+en recopiant la valeur depuis l'impression anglaise. 77 % de la table réécrite
+deux fois par run pour revenir au point de départ.
+
+### Modifié
+
+- `_upsert_printings()` : `cardmarket_id = coalesce(excluded.cardmarket_id,
+  scryfall_card_printings.cardmarket_id)`. Une seule colonne est concernée,
+  listée dans `PRESERVE_IF_NULL`.
+
+### Mesuré sur la base locale, même bulk
+
+| | Avant | Après |
+|---|---|---|
+| Lignes propagées | 401 359 | **0** |
+| Durée de la propagation | 68 s | **1 s** |
+| Import des cartes | 6 min 30 | 4 min 50 |
+| **Étape Scryfall complète** | **466 s** | **295 s** (−37 %) |
+
+Aucune donnée perdue : 519 124 impressions portent un `cardmarket_id` avant
+comme après. L'import des cartes gagne lui aussi, l'upsert ne réécrivant plus
+ces 401 230 lignes — donc moins de WAL et moins de tuples morts.
+
+Report attendu en production, où la propagation prend 24 à 25 min : étape
+Scryfall de **84 min à 45-60 min**, à confirmer par un vrai run.
+
+### Conséquence assumée
+
+Un `cardmarket_id` ne peut plus être **effacé** par le bulk. Si Scryfall retire
+l'identifiant d'un produit délisté, l'ancienne valeur subsiste. C'était déjà
+largement le cas — la propagation la recopiait depuis une impression voisine —
+et le rapport de liaison Cardmarket surveille cet écart (10 lignes sans
+correspondance au 19/09).
+
+### Non traité
+
+L'upsert réécrit toujours 520 463 tuples même quand rien n'a changé. C'est le
+dernier gros gisement, et il mérite sa propre livraison.
+
+---
+
 ## [Non publié] — 2026-09-19 (2) — Résistance aux coupures de base
 
 Le premier run de production sur Render a échoué après 70 minutes, quand la base
