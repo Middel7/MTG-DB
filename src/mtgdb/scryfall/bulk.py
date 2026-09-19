@@ -12,12 +12,11 @@ from pathlib import Path
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from tqdm import tqdm
 
 from mtgdb.db.models.import_run import ImportRun
-from mtgdb.db.models.mtg_set import MtgSet
+from mtgdb.scryfall.upserts import ecrire_sets
 
 log = logging.getLogger("mtgdb.scryfall.bulk")
 
@@ -143,20 +142,7 @@ def import_sets(client: httpx.Client, session: Session) -> int:
         })
     if not rows:
         return 0
-    stmt = pg_insert(MtgSet).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["code"],
-        set_={
-            "name": stmt.excluded.name,
-            "set_type": stmt.excluded.set_type,
-            "released_at": stmt.excluded.released_at,
-            "block": stmt.excluded.block,
-            "parent_set_code": stmt.excluded.parent_set_code,
-            "card_count": stmt.excluded.card_count,
-            "icon_svg_uri": stmt.excluded.icon_svg_uri,
-        },
-    )
-    session.execute(stmt)
+    ecrire_sets(session, rows)
     session.commit()
     return len(rows)
 
