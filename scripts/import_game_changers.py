@@ -61,9 +61,17 @@ def update_database(game_changer_names: list[str], dry_run: bool = False) -> Non
     load_dotenv(ROOT / ".env")
 
     import os
-    db_url = os.environ.get("DATABASE_URL")
+
+    from mtgdb.db.urls import normalize_database_url
+
+    # Ce script lit DATABASE_URL directement dans l'environnement : il ne passe
+    # pas par mtgdb.db.engine, et n'hérite donc pas de la normalisation qui s'y
+    # fait. Render fournit encore des URL en postgres://, que SQLAlchemy 2
+    # refuse — la correction était portée par update-prod.ps1, qui n'est plus
+    # sur le chemin de la production.
+    db_url = normalize_database_url(os.environ.get("DATABASE_URL"))
     if not db_url:
-        print("[ERREUR] DATABASE_URL absent du .env")
+        print("[ERREUR] DATABASE_URL absent de l'environnement et du .env")
         sys.exit(1)
 
     if dry_run:

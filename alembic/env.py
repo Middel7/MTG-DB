@@ -20,6 +20,7 @@ load_dotenv(ROOT / ".env")
 
 from mtgdb.db.base import Base  # noqa: E402
 import mtgdb.db.models  # noqa: E402, F401
+from mtgdb.db.urls import normalize_database_url  # noqa: E402
 
 config = context.config
 if config.config_file_name is not None:
@@ -27,7 +28,13 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-database_url = os.getenv("DATABASE_URL")
+# Troisième point de lecture de DATABASE_URL dans le dépôt, après
+# mtgdb.db.engine et scripts/import_game_changers.py. Il n'est pas sur le chemin
+# du Cron Job Render (un run n'applique jamais de migration), mais c'est celui
+# qu'on utilise à la main pour migrer la production : il doit accepter le
+# préfixe postgres:// que Render affiche encore, sans quoi la commande échoue au
+# moment précis où l'on en a le plus besoin.
+database_url = normalize_database_url(os.getenv("DATABASE_URL"))
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 

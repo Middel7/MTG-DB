@@ -1,23 +1,43 @@
-﻿# Mise à jour de la base de PRODUCTION (Render) depuis ce poste.
+﻿# Rattrapage MANUEL de la base de PRODUCTION (Render) depuis ce poste.
 #
-#   .\update-prod.ps1 --skip tags   # run quotidien
-#   .\update-prod.ps1 --only tags   # run hebdomadaire des tags
+#   .\update-prod.ps1 --skip tags   # rejouer le run quotidien
+#   .\update-prod.ps1 --only tags   # rejouer le run hebdomadaire des tags
 #   .\update-prod.ps1 --dry-run     # plan sans exécution
 #
-# Identique à update.ps1 à une différence près : les variables de .env.prod
-# (git-ignoré) sont exportées AVANT l'appel. Les trois points de chargement du
-# .env (src/mtgdb/db/engine.py, alembic/env.py, scripts/import_game_changers.py)
+# ── Ce script n'est plus le montage nominal ─────────────────────────────────
+#
+# La production est alimentée par deux Cron Jobs Render qui exécutent le
+# Dockerfile de ce dépôt (voir render.yaml et docs/deploiement.md). Plus aucune
+# tâche planifiée Windows ne vise la prod.
+#
+# Ce script reste pour les deux seuls cas où il sert encore :
+#
+#   - incident Render (job en échec, plateforme indisponible, build cassé) ;
+#   - rattrapage immédiat quand on ne veut pas attendre le créneau de 01:00 UTC.
+#
+# Il sera plus lent qu'un run Render : ~9 min de latence réseau et de transfert
+# s'ajoutent, mesurés (RTT SQL médian 22 ms, upload 20-25 Mbit/s), et le lien
+# WAN peut lâcher en cours de route — c'est ce qui a fait échouer le run du
+# 17/09 après 78 minutes de travail.
+#
+# ── Ce qu'il fait, et ce qu'il ne fait plus ─────────────────────────────────
+#
+# Il charge .env.prod (git-ignoré) et exporte ses variables avant d'appeler
+# update.ps1. Cela fonctionne parce que les trois points de chargement du .env
+# — src/mtgdb/db/engine.py, alembic/env.py, scripts/import_game_changers.py —
 # appellent load_dotenv() SANS override : une variable déjà définie dans
-# l'environnement l'emporte donc sur le .env local. C'est ce qui permet de viser
-# la prod sans modifier le .env de développement.
+# l'environnement l'emporte sur le .env de développement.
 #
-# ⚠️ Le verrou data/.update_all.lock est commun à TOUS les runs de ce dépôt :
-# un run prod lancé pendant un run local sort en code 2 sans rien faire. Les
-# horaires des tâches planifiées sont espacés pour cette raison.
+# Les deux garde-fous qu'il portait autrefois vivent désormais en Python, donc
+# sur tous les chemins d'exécution, conteneur compris :
 #
-# Mesure du 2026-08-30 : un run complet vers Render a pris 2 h 19 (dont 2 h 11
-# pour la seule étape Scryfall), contre 7 min sur la base locale. Le goulot est
-# le disque de l'instance Render, pas la liaison Internet.
+#   postgres:// → postgresql://   mtgdb.db.urls.normalize_database_url(),
+#                                 appelée par les trois points de chargement ;
+#   refus de localhost            mtgdb.db.engine.assert_remote_database(),
+#                                 appelée par scripts/update_all.py.
+#
+# Ce script se contente d'armer le second en posant MTGDB_REQUIRE_REMOTE_DB :
+# hors conteneur, rien ne distingue autrement un run « prod » d'un run local.
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -48,20 +68,11 @@ if (-not $env:DATABASE_URL) {
     exit 1
 }
 
-# psycopg2 refuse le préfixe postgres:// que Render fournit encore dans son
-# interface. La correction est purement syntaxique et sans effet de bord.
-if ($env:DATABASE_URL.StartsWith("postgres://")) {
-    $env:DATABASE_URL = "postgresql://" + $env:DATABASE_URL.Substring("postgres://".Length)
-    Write-Host "Prefixe postgres:// corrige en postgresql:// (refuse par psycopg2)."
-}
+# Arme le garde-fou côté Python : un .env.prod mal rempli qui pointerait sur la
+# base locale doit faire échouer le run AVANT la première écriture, plutôt que
+# de produire un rapport final tout vert sur la mauvaise base.
+$env:MTGDB_REQUIRE_REMOTE_DB = "1"
 
-# Garde-fou : sans lui, un .env.prod mal rempli ferait tourner le run "prod"
-# sur la base locale, en silence et avec un rapport final tout vert.
-if ($env:DATABASE_URL -match "@(localhost|127\.0\.0\.1)[:/]") {
-    Write-Error "DATABASE_URL de .env.prod pointe sur localhost : ce n'est pas la prod. Abandon."
-    exit 1
-}
-
-Write-Host "Cible : PRODUCTION (Render) — variables chargees : $($loaded -join ', ')"
+Write-Host "Cible : PRODUCTION (Render), rattrapage manuel — variables chargees : $($loaded -join ', ')"
 & (Join-Path $root "update.ps1") @args
 exit $LASTEXITCODE

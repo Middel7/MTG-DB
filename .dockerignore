@@ -16,7 +16,15 @@ __pycache__/
 .vscode/
 .idea/
 
-# Docs (inutiles à l'exécution)
+# Docs, tests et outillage d'hôte : inutiles à l'exécution du conteneur.
+# (Le Dockerfile ne COPY que src/, scripts/, alembic/ — ceci allège le contexte
+# de build envoyé au démon, pas l'image elle-même.)
 docs/
+tests/
 README.md
+CHANGELOG.md
+render.yaml
 update.ps1
+update-prod.ps1
+.env.prod
+.env.prod.example

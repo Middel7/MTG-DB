@@ -1,4 +1,4 @@
-# Mise à jour complète de la base MTG-DB.
+﻿# Mise à jour complète de la base MTG-DB.
 #
 #   .\update.ps1                    # tout mettre à jour
 #   .\update.ps1 --only cardmarket  # une seule source

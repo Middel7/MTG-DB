@@ -15,6 +15,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
+from mtgdb.db.urls import (
+    is_local_database_url,
+    normalize_database_url,
+    redact_database_url,
+)
+from mtgdb.runtime import env_flag, in_container
+
 # Cherche un .env dans le répertoire courant ou ses parents
 _cwd = Path.cwd()
 for _parent in [_cwd, *_cwd.parents]:
@@ -23,7 +30,11 @@ for _parent in [_cwd, *_cwd.parents]:
         load_dotenv(_dotenv)
         break
 
-DATABASE_URL: Optional[str] = os.getenv("DATABASE_URL")
+# Render fournit encore des URL en postgres://, que SQLAlchemy 2 refuse. La
+# correction était portée par update-prod.ps1, qui ne tourne plus sur le chemin
+# de la production : elle doit avoir lieu ici, au seul endroit que tous les
+# consommateurs traversent.
+DATABASE_URL: Optional[str] = normalize_database_url(os.getenv("DATABASE_URL"))
 
 if DATABASE_URL:
     engine: Optional[Engine] = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
@@ -31,6 +42,10 @@ if DATABASE_URL:
 else:
     engine = None
     SessionLocal = None  # type: ignore[assignment]
+
+
+class LocalDatabaseRefused(RuntimeError):
+    """La base visée est locale alors que le contexte exige une base distante."""
 
 
 def get_db():
@@ -45,6 +60,51 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def assert_remote_database(url: Optional[str] = None) -> None:
+    """
+    Refuse une base locale lorsqu'on tourne en conteneur. Lève LocalDatabaseRefused.
+
+    Ce garde-fou vient d'`update-prod.ps1` : sans lui, un run « production » mal
+    configuré met à jour la base de développement et rend un rapport tout vert.
+    En conteneur le diagnostic est encore plus certain qu'il ne l'était sur le
+    poste — `localhost`, vu depuis un Cron Job Render, ne désigne rien d'autre
+    que le conteneur lui-même.
+
+    Volontairement appelée par les points d'entrée (scripts/update_all.py), et
+    non à l'import du module : `mtgdb.db.engine` est une bibliothèque, importée
+    par ManaMind_AI et RELIC-Trade. Une exception levée à l'import en casserait
+    le démarrage pour une raison qui ne les concerne pas.
+
+    Deux façons d'activer le garde-fou :
+
+      - tourner en conteneur, détecté par `mtgdb.runtime.in_container()` ;
+      - poser MTGDB_REQUIRE_REMOTE_DB=1, ce que fait `update-prod.ps1` quand on
+        lance un rattrapage vers la production depuis le poste. Sans cette
+        seconde porte, le garde-fou disparaîtrait du seul chemin où il
+        protégeait quelque chose avant le passage au cloud.
+
+    MTGDB_ALLOW_LOCAL_DB=1 lève la restriction, pour le cas légitime d'un
+    conteneur qui vise une base publiée sur l'hôte.
+    """
+    target = normalize_database_url(url) if url is not None else DATABASE_URL
+    if not target:
+        raise RuntimeError(
+            "DATABASE_URL absent. En conteneur, fournis-la par l'environnement "
+            "du service (jamais par un .env embarqué dans l'image)."
+        )
+    enforced = in_container() or env_flag("MTGDB_REQUIRE_REMOTE_DB")
+    if not enforced or env_flag("MTGDB_ALLOW_LOCAL_DB"):
+        return
+    if is_local_database_url(target):
+        contexte = "ce run tourne en conteneur" if in_container() else                    "ce run exige une base distante (MTGDB_REQUIRE_REMOTE_DB)"
+        raise LocalDatabaseRefused(
+            f"DATABASE_URL pointe sur une base locale ({redact_database_url(target)}) "
+            f"alors que {contexte} : ce n'est pas la production. "
+            f"Abandon avant toute écriture. "
+            f"(MTGDB_ALLOW_LOCAL_DB=1 pour passer outre en connaissance de cause.)"
+        )
 
 
 def check_connection() -> bool:
