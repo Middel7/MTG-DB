@@ -51,6 +51,32 @@ Correctifs appliqués :
 
 ---
 
+## ⚠️ `downgrade` n'est pas un rollback sur cette base
+
+`alembic downgrade` est documenté partout comme l'inverse d'`upgrade`. Sur une
+base partagée, c'est faux : deux révisions de ce dépôt cassent les consommateurs
+ou détruisent des données.
+
+| Révision | Ce que fait son `downgrade` | Conséquence |
+|---|---|---|
+| `20260609_rename_scryfall_tables` | `scryfall_cards` → `cards`, etc. | ManaMind_AI, RELIC-Trade et mtgtrade échouent sur « relation does not exist », immédiatement |
+| `20260609_refactor_translations` | `DROP COLUMN card_printings.printed_name` | Perte de 539 629 valeurs, reconstituables seulement par un réimport complet du bulk. C'est la colonne de la recherche multilingue de RELIC-Trade |
+
+Ces deux `downgrade()` **refusent désormais de s'exécuter** et lèvent une
+`RuntimeError` explicite. L'échappatoire suit la convention de
+`MTGDB_ALLOW_LOCAL_DB` :
+
+```powershell
+$env:MTGDB_ALLOW_DESTRUCTIVE_DOWNGRADE = "1"   # en connaissance de cause
+```
+
+**En cas de migration ratée, la bonne réponse est une nouvelle migration
+`upgrade` qui corrige**, pas un retour en arrière. Un `upgrade` est vérifiable
+sur la base locale avant d'être joué en production ; un `downgrade` sur une base
+partagée ne l'est pas.
+
+---
+
 ## Commandes
 
 ```powershell
@@ -58,7 +84,7 @@ alembic current                                # révision courante de MTG-DB
 alembic heads                                  # doit afficher UNE seule head
 alembic upgrade head                           # appliquer
 alembic revision --autogenerate -m "message"   # générer
-alembic downgrade -1                           # revenir en arrière
+alembic downgrade -1                           # ⚠️ voir l'encadré ci-dessus
 ```
 
 ---
