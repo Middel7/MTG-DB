@@ -85,6 +85,31 @@ déduplication écartait depuis toujours.
   vérifier chez les consommateurs** s'ils s'en servaient comme signal de
   fraîcheur — `import_runs.finished_at` est la source correcte pour cela.
 
+### Réparation des prix orphelins historiques
+
+Le correctif de la livraison (5) empêche de créer de nouvelles lignes orphelines,
+mais ne retouche pas les 252 414 existantes. `scripts/reparer_prix_orphelins.py`
+s'en charge, avec `--dry-run` et par lots : 524 lignes dont le produit existait
+déjà, 251 890 dont le produit — 5 085 au total — a disparu du catalogue
+Cardmarket et doit être reconstitué.
+
+Rien n'est inventé : `raw_json` conserve l'`idProduct` d'origine, le rattachement
+n'est qu'une relecture. Les lignes dont le `raw_json` ne porte pas d'identifiant
+numérique restent intactes et sont signalées.
+
+> ⚠️ Ce script crée des `cardmarket_products` à `en_name` vide, en attendant que
+> le Product Catalog les renseigne. **À vérifier chez les consommateurs** avant
+> de l'exécuter en production : ManaMind_AI et RELIC-Trade lisent cette table, et
+> un code qui suppose `en_name` non vide afficherait mal ces lignes.
+
+Appliqué sur la base locale le 19/09/2026 (0 orpheline restante, 127 384
+produits). **Pas** sur la production.
+
+> Leçon retenue dans les tests : un script dont la portée est la table entière ne
+> peut pas être testé sur une base partagée — l'appeler depuis un test répare tout
+> ce qu'il trouve. `tests/test_reparation_prix_orphelins.py` crée donc sa propre
+> base, y joue les migrations, et la détruit.
+
 ### Divers
 
 - `Decimal` au lieu de `float` pour les prix Scryfall, par cohérence avec le
