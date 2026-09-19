@@ -122,3 +122,35 @@ def test_update_all_sort_en_code_2_quand_le_verrou_est_tenu(database_url):
     assert "verrou" in proc.stdout.lower()
     # Aucune étape ne doit avoir démarré.
     assert "[1/1]" not in proc.stdout
+
+@pytest.mark.integration
+def test_la_connexion_du_verrou_ne_reste_pas_en_transaction(database_url):
+    """
+    La session porteuse doit être `idle`, jamais `idle in transaction`.
+
+    Constaté en production le 19/09 : SQLAlchemy ouvre une transaction implicite
+    au premier `SELECT 1` du heartbeat et ne la referme jamais. La session reste
+    alors `idle in transaction` pendant les deux heures du run, ce qui gèle
+    l'horizon de `VACUUM` : les tuples morts des 520 000 lignes réécrites ne
+    peuvent plus être recyclés, et l'IO qu'on cherche à réduire empire.
+    """
+    import time
+
+    engine = create_engine(database_url)
+    try:
+        with advisory_lock(database_url, heartbeat_seconds=0.2):
+            time.sleep(0.6)  # laisse passer plusieurs battements
+            with engine.connect() as conn:
+                etat = conn.execute(text("""
+                    SELECT a.state FROM pg_stat_activity a
+                    JOIN pg_locks l ON l.pid = a.pid
+                    WHERE l.locktype = 'advisory' AND l.granted
+                      AND (l.classid::bigint << 32) | l.objid::bigint = :k
+                """), {"k": UPDATE_ALL_LOCK_KEY}).scalar()
+        assert etat is not None, "la session porteuse du verrou est introuvable"
+        assert etat != "idle in transaction", (
+            "la connexion du verrou laisse une transaction ouverte : "
+            "elle bloquerait le VACUUM pendant toute la durée du run"
+        )
+    finally:
+        engine.dispose()

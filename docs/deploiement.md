@@ -36,6 +36,9 @@ l'hiver, 03:00 l'été.
 | **Idempotence** | Un bulk Scryfall déjà importé n'est **ni retéléchargé ni re-parsé** (comparaison de `import_runs.source_file`, en base — pas sur le disque). |
 | **Purge automatique** | Les anciens bulks (393 Mo pièce) sont supprimés **avant** le téléchargement du suivant : le pic disque est d'un seul fichier. |
 | **Journalisation** | Sur un poste : `logs/update_<horodatage>.log`, 30 derniers conservés. En conteneur : **stdout uniquement**, le disque étant éphémère. |
+| **Reprise sur coupure** | Une interruption transitoire de la base (recovery, SSL coupé, connexion refusée) déclenche jusqu'à 5 réessais espacés de 5 s à 2 min, avec recyclage du pool. Les erreurs de données, elles, ne sont jamais rejouées. |
+| **Statut honnête** | Un run qui a perdu des cartes est marqué `partial`, pas `success` : le bulk sera repris au run suivant et la supervision voit le décrochage. |
+| **Runs orphelins** | Un run resté `running` depuis plus de 6 h est marqué `failed` par le run suivant. |
 | **Codes de sortie** | `0` succès · `1` au moins une étape en échec · `2` un run est déjà en cours. |
 
 ---
@@ -120,6 +123,47 @@ C'est la signature du plus petit plan payant (**Basic-256mb : 256 Mo de RAM,
 > **Le passage au cloud supprime la dépendance au poste, pas la lenteur.**
 > Le seul levier sur la durée est le plan de la base — décision qui engage aussi
 > RELIC-Trade, qui partage cette instance.
+
+---
+
+## Résistance aux coupures de base
+
+Deux runs ont été perdus en trois jours, pour la même raison de fond :
+
+| Date | Origine | Erreur | Perdu |
+|---|---|---|---|
+| 17/09 | poste Windows | `SSL connection has been closed unexpectedly` | 78 min |
+| 19/09 | Cron Job Render | `the database system is not yet accepting connections` / `Consistent recovery state has not been yet reached` | 70 min |
+
+Le second est instructif : l'enchaînement exact était un batch en échec → le
+`session.rollback()` du bloc de rattrapage tente de rouvrir une connexion et
+lève **à son tour** → l'exception remonte hors de tout `except` → le
+`session.commit()` final échoue pour la même raison → le processus meurt sans
+jamais pouvoir marquer le run `failed`, qui reste `running` pour toujours.
+
+Trois mécanismes répondent à cela, dans `mtgdb.db.retry` et
+`scripts/import_scryfall.py` :
+
+1. **Réessai** — un batch ou une propagation qui échoue sur une erreur de
+   transport est rejoué jusqu'à 5 fois (5 s, 15 s, 30 s, 1 min, 2 min), avec
+   `engine.dispose()` entre chaque pour ne pas réutiliser un socket mort. Les
+   opérations concernées sont toutes idempotentes (`ON CONFLICT DO UPDATE`,
+   `UPDATE` conditionnels). Une erreur de contrainte ou de syntaxe n'est
+   **jamais** rejouée : elle ne guérirait pas en attendant.
+2. **Nettoyage jamais fatal** — `_safe_rollback()` ne lève pas, et la
+   finalisation du run passe par une **session neuve** plutôt que par la session
+   accidentée, dont un `rollback` expirerait les objets ORM et perdrait
+   silencieusement le statut qu'on vient d'y écrire.
+3. **Runs orphelins** — au démarrage, tout run `running` de plus de 6 h est
+   marqué `failed`. Le seuil n'est qu'une sécurité : c'est le verrou advisory
+   qui garantit qu'aucun autre run ne tourne vraiment.
+
+Enfin, la connexion qui porte le verrou est en **`AUTOCOMMIT`**. Sans cela,
+SQLAlchemy ouvre une transaction implicite au premier battement du heartbeat et
+ne la referme jamais : la session reste `idle in transaction` pendant les deux
+heures du run, ce qui gèle l'horizon de `VACUUM` et empêche de recycler les
+tuples morts des 520 000 lignes réécrites — aggravant exactement l'IO qu'on
+cherche à réduire.
 
 ---
 
