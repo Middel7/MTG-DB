@@ -24,11 +24,12 @@ import logging
 import os
 import sys
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
@@ -472,10 +473,15 @@ def _parse_price_rows(prices: dict[str, Any], printing_id: int,
                 "source": "scryfall",
                 "currency": currency,
                 "price_type": price_type,
-                "price": float(price_str),
+                # Decimal, jamais float : la colonne est Numeric(10, 2) et il
+                # s'agit de monnaie. L'arrondi absorbait l'imprécision du
+                # flottant, mais le pipeline Cardmarket, lui, fait déjà
+                # `Decimal(s)` — l'asymétrie n'avait aucune raison d'être sur le
+                # seul sujet où elle ne se justifie jamais.
+                "price": Decimal(str(price_str)),
                 "date": today,
             })
-        except (ValueError, TypeError):
+        except (InvalidOperation, ValueError, TypeError):
             pass
     return rows
 
@@ -484,10 +490,27 @@ def _parse_price_rows(prices: dict[str, Any], printing_id: int,
 # 4. UPSERTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Colonnes de `scryfall_cards` qui décrivent la CARTE, jamais l'impression. Le
+# bulk les répète à l'identique sur chacune des impressions d'une même carte :
+# c'est pourquoi ne retenir que la première occurrence du run est sans perte.
+_COLONNES_CARTE = (
+    "name", "normalized_name", "mana_cost", "mana_value", "type_line",
+    "oracle_text", "power", "toughness", "loyalty", "defense",
+    "colors", "color_identity", "keywords", "legal_commander", "edhrec_rank",
+)
+
+
 def _upsert_cards(session: Session, rows: list[dict]) -> dict[str, int]:
     stmt = pg_insert(Card).values(rows)
     stmt = stmt.on_conflict_do_update(
         index_elements=["oracle_id"],
+        # N'écrire que ce qui change réellement. Sans ce prédicat, chaque upsert
+        # produit un UPDATE — donc un tuple mort, du WAL, et une valeur de
+        # séquence consommée — même quand la ligne est rigoureusement identique.
+        where=or_(*[
+            getattr(Card, colonne).is_distinct_from(getattr(stmt.excluded, colonne))
+            for colonne in _COLONNES_CARTE
+        ]),
         set_={
             "name":             stmt.excluded.name,
             "normalized_name":  stmt.excluded.normalized_name,
@@ -548,16 +571,35 @@ def _upsert_printings(session: Session, rows: list[dict]) -> dict[str, int]:
         "cardmarket_id", "tcgplayer_id", "printed_name",
     ]
     stmt = pg_insert(CardPrinting).values(rows)
+
+    def valeur_cible(col: str):
+        """Ce que la colonne vaudra après l'upsert."""
+        if col in PRESERVE_IF_NULL:
+            return func.coalesce(getattr(stmt.excluded, col), getattr(CardPrinting, col))
+        return getattr(stmt.excluded, col)
+
     stmt = stmt.on_conflict_do_update(
         index_elements=["scryfall_id"],
-        set_={
-            col: (
-                func.coalesce(getattr(stmt.excluded, col), getattr(CardPrinting, col))
-                if col in PRESERVE_IF_NULL
-                else getattr(stmt.excluded, col)
-            )
+        # Ne réécrire que les impressions réellement modifiées.
+        #
+        # Sans ce prédicat, les 520 000 lignes de la table étaient réécrites à
+        # chaque run, que le bulk ait changé quelque chose ou non : 43 785 680
+        # UPDATE cumulés pour 11 449 INSERT, mesurés dans pg_stat_user_tables.
+        # C'est le « dernier gros gisement » que le CHANGELOG du 19/09 identifiait
+        # sans le traiter.
+        #
+        # `IS DISTINCT FROM` et non `!=` : la table est pleine de NULL
+        # (cardmarket_id, printed_name, tcgplayer_id…), et `NULL != NULL` vaut
+        # NULL, donc faux — la moitié des colonnes ne serait jamais comparée.
+        #
+        # La comparaison porte sur la valeur CIBLE, coalesce comprise : sinon une
+        # impression dont le bulk ne fournit pas le cardmarket_id serait vue comme
+        # modifiée à chaque run, et on retomberait sur le problème d'origine.
+        where=or_(*[
+            getattr(CardPrinting, col).is_distinct_from(valeur_cible(col))
             for col in update_cols
-        },
+        ]),
+        set_={col: valeur_cible(col) for col in update_cols},
     )
     session.execute(stmt)
     scryfall_ids = [r["scryfall_id"] for r in rows]
@@ -628,7 +670,21 @@ def _flush_batch(
     card_rows: list[dict],
     raw_cards: list[dict[str, Any]],
     today: date,
+    cache_oracle: dict[str, int] | None = None,
 ) -> tuple[int, int]:
+    """
+    Écrit un lot du bulk. Retourne (cartes upsertées, impressions upsertées).
+
+    `cache_oracle` mémorise, pour tout le run, la correspondance
+    `oracle_id → scryfall_cards.id`. Il rend la déduplication des cartes GLOBALE
+    et non plus locale au lot : sans lui, un terrain de base présent dans 800 lots
+    est upserté 800 fois. Mesuré sur la base locale : 27 073 993 UPDATE cumulés
+    sur une table de 38 907 lignes, soit un facteur 13,4 de travail inutile à
+    chaque run, sur l'instance PostgreSQL qui est déjà le goulot de la production.
+
+    Omettre l'argument conserve l'ancien comportement, autonome et sans état —
+    ce qui garde la fonction testable lot par lot.
+    """
     # Deux déduplications de natures DIFFÉRENTES. Les confondre a coûté 4 % du
     # catalogue à chaque run.
     #
@@ -653,7 +709,17 @@ def _flush_batch(
         seen_sid[raw["id"]] = i
     raw_cards = [raw_cards[i] for i in sorted(seen_sid.values())]
 
-    oracle_to_id = _upsert_cards(session, card_rows)
+    # Ne proposer à l'upsert que les cartes jamais vues dans ce run. Les colonnes
+    # de `scryfall_cards` décrivent la carte, pas l'impression : le bulk les
+    # répète à l'identique sur chaque impression, et la première occurrence fait
+    # donc aussi bien autorité que la dernière.
+    if cache_oracle is None:
+        cache_oracle = {}
+    deja_traitees = set(cache_oracle)
+    nouvelles = [ligne for ligne in card_rows if ligne["oracle_id"] not in deja_traitees]
+    if nouvelles:
+        cache_oracle.update(_upsert_cards(session, nouvelles))
+    oracle_to_id = cache_oracle
 
     printing_rows: list[dict] = []
     faces_par_carte: dict[int, list[dict]] = {}
@@ -664,11 +730,18 @@ def _flush_batch(
         card_id = oracle_to_id.get(oracle_id)
         if card_id is None:
             continue
-        # Les faces appartiennent à la CARTE, pas à l'impression. Depuis que
-        # plusieurs impressions d'une même carte cohabitent dans un lot, les
-        # parser à chaque fois ferait insérer les mêmes faces autant de fois :
-        # `scryfall_card_faces` n'a aucune contrainte d'unicité pour l'empêcher.
-        if card_id not in faces_par_carte:
+        # Les faces appartiennent à la CARTE, pas à l'impression, et `_replace_faces`
+        # procède par DELETE puis INSERT. Deux raisons de ne les traiter qu'une
+        # fois par carte et par run :
+        #
+        #   - dans un même lot, plusieurs impressions d'une même carte
+        #     insèreraient les mêmes faces autant de fois, et
+        #     `scryfall_card_faces` n'a aucune contrainte d'unicité pour l'empêcher ;
+        #   - d'un lot à l'autre, refaire le DELETE+INSERT ne change rien à la
+        #     donnée et ne produit que des tuples morts. La table en cumulait
+        #     1 152 858 insertions pour 1 152 808 suppressions, soit un
+        #     remplacement intégral à chaque run.
+        if oracle_id not in deja_traitees and card_id not in faces_par_carte:
             faces = _parse_face_rows(raw, card_id)
             if faces:
                 faces_par_carte[card_id] = faces
@@ -690,11 +763,17 @@ def _flush_batch(
         _insert_prices(session, price_rows)
 
     session.commit()
-    return len(card_rows), len(printing_rows)
+    # `nouvelles` et non `card_rows` : le compteur doit refléter les cartes
+    # réellement upsertées. Additionné sur le run, il converge vers le nombre de
+    # cartes oracle distinctes (~38 900) au lieu du nombre de lignes du bulk.
+    return len(nouvelles), len(printing_rows)
 
 
 def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
     today = date.today()
+    # Partagé par tous les lots du run : c'est ce qui rend la déduplication des
+    # cartes globale. ~38 900 entrées en fin de run, quelques mégaoctets.
+    cache_oracle: dict[str, int] = {}
     cards_imported = 0
     printings_imported = 0
     errors_count = 0
@@ -737,7 +816,8 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
                     # réaffectées qu'au tour suivant, une fois l'appel terminé —
                     # la capture tardive que la règle signale ne peut pas se
                     # produire ici.
-                    lambda: _flush_batch(session, lot_cartes, lot_bruts, today),  # noqa: B023
+                    lambda: _flush_batch(session, lot_cartes, lot_bruts, today,  # noqa: B023
+                                        cache_oracle),
                     description=f"[BATCH] cartes {cards_imported}–{cards_imported + BATCH_SIZE}",
                     on_retry=lambda: _safe_rollback(session),
                 )
@@ -769,7 +849,8 @@ def import_cards(file_path: Path, session: Session) -> tuple[int, int, int]:
     if card_rows_buf:
         try:
             c, p = retry_transient(
-                lambda: _flush_batch(session, card_rows_buf, raw_cards_buf, today),
+                lambda: _flush_batch(session, card_rows_buf, raw_cards_buf, today,
+                                     cache_oracle),
                 description="[BATCH] dernier batch",
                 on_retry=lambda: _safe_rollback(session),
             )

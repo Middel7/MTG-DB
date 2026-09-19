@@ -5,6 +5,267 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [Non publié] — 2026-09-19 (6) — Suites d'audit : performance et dette
+
+Branche `perf/p2-upsert`.
+
+### Le sur-upsert, mesuré puis supprimé
+
+Trois gisements, tous relevés dans `pg_stat_user_tables` sur la base locale.
+
+| Table | INSERT cumulés | UPDATE cumulés | Lignes réelles |
+|---|---|---|---|
+| `scryfall_cards` | 544 | **27 073 993** | 38 907 |
+| `scryfall_card_printings` | 11 449 | **43 785 680** | 539 629 |
+| `scryfall_card_faces` | 1 152 858 | 0 (DELETE+INSERT) | 6 459 |
+
+1. **Cartes.** La déduplication par `oracle_id` était locale au lot de 500 : un
+   terrain de base présent dans 800 lots était upserté 800 fois. Un cache
+   `oracle_id → id` partagé par tout le run la rend globale.
+2. **Impressions.** L'upsert porte désormais un `WHERE … IS DISTINCT FROM` sur
+   la valeur **cible**, `coalesce` comprise — sans quoi une impression dont le
+   bulk ne fournit pas le `cardmarket_id` serait vue comme modifiée à chaque
+   passage, et l'on retomberait sur le problème d'origine. C'est le « dernier
+   gros gisement » que la livraison (3) identifiait sans le traiter.
+3. **Faces.** `_replace_faces()` procède par DELETE puis INSERT ; le rejouer à
+   chaque lot ne changeait rien à la donnée et ne produisait que des tuples
+   morts. Traitées une seule fois par carte et par run.
+
+### Les exports Cardmarket ne sont plus chargés en mémoire
+
+`ijson` figurait dans les dépendances depuis l'origine **sans avoir jamais été
+utilisé** : le bulk Scryfall est passé au JSONL gzippé, qui se lit ligne à ligne,
+et personne n'est revenu sur les fichiers Cardmarket.
+
+Mesuré sur le price guide du 19/09, 127 379 entrées :
+
+| | Pic mémoire |
+|---|---|
+| `json.load()` | 109,2 Mo |
+| streaming `ijson` | **0,5 Mo** |
+
+> ⚠️ Piège rencontré, et silencieux jusqu'à l'INSERT : par défaut ijson rend les
+> nombres en `Decimal` là où `json.load()` rendait des `float`. L'objet brut part
+> tel quel dans la colonne JSONB `raw_json`, que `json.dumps()` ne sait pas
+> sérialiser — **tous** les imports de Price Guide auraient échoué, les prix
+> Cardmarket étant des nombres JSON (`"avg":0.09`) et non des chaînes. D'où
+> `use_float=True`, vérifié sur le fichier réel et verrouillé par un test.
+
+### Mesuré sur un run réel, base locale, même bulk
+
+Run `#118`, `--force`, 228 s.
+
+| | Avant | Après |
+|---|---|---|
+| Impressions upsertées | 520 790 | **542 827** |
+| `cards_imported` | 520 790 | **38 906** |
+| `UPDATE` sur `scryfall_cards` | ~520 790 | **0** |
+| `UPDATE` sur `scryfall_card_printings` | ~520 790 | **10 855** |
+| `INSERT` sur `scryfall_card_faces` | ~23 000 | **6 459** |
+| `cards_id_seq` consommée | +520 790 | **+38 906** |
+
+Zéro `UPDATE` sur `scryfall_cards` : aucune carte n'avait changé, et l'upsert
+n'écrit plus rien dans ce cas. Sur les impressions, 10 855 lignes réellement
+modifiées sur 542 827 proposées — soit **2 %** au lieu de 100 %.
+
+**3 247 impressions sont entrées en base** à ce seul run : celles que la
+déduplication écartait depuis toujours.
+
+> ⚠️ `card_printings_id_seq` consomme toujours une valeur par ligne **proposée**,
+> `ON CONFLICT` compris : +542 827 par run, contre +520 790 avant. La colonne est
+> un `integer` et la séquence est à 40 287 391, soit **1,9 % de son plafond** —
+> environ 5,3 ans au rythme local. Le passage en `bigint` reste à faire ; il
+> réécrit la table et demande une fenêtre annoncée.
+
+### Conséquences visibles
+
+- `cards_imported` converge vers ~38 900 au lieu de ~520 000 : il compte enfin
+  les cartes, non les lignes du bulk ;
+- `updated_at` cesse d'avancer sur les lignes réellement inchangées. **À
+  vérifier chez les consommateurs** s'ils s'en servaient comme signal de
+  fraîcheur — `import_runs.finished_at` est la source correcte pour cela.
+
+### Réparation des prix orphelins historiques
+
+Le correctif de la livraison (5) empêche de créer de nouvelles lignes orphelines,
+mais ne retouche pas les 252 414 existantes. `scripts/reparer_prix_orphelins.py`
+s'en charge, avec `--dry-run` et par lots : 524 lignes dont le produit existait
+déjà, 251 890 dont le produit — 5 085 au total — a disparu du catalogue
+Cardmarket et doit être reconstitué.
+
+Rien n'est inventé : `raw_json` conserve l'`idProduct` d'origine, le rattachement
+n'est qu'une relecture. Les lignes dont le `raw_json` ne porte pas d'identifiant
+numérique restent intactes et sont signalées.
+
+> ⚠️ Ce script crée des `cardmarket_products` à `en_name` vide, en attendant que
+> le Product Catalog les renseigne. **À vérifier chez les consommateurs** avant
+> de l'exécuter en production : ManaMind_AI et RELIC-Trade lisent cette table, et
+> un code qui suppose `en_name` non vide afficherait mal ces lignes.
+
+Appliqué sur la base locale le 19/09/2026 (0 orpheline restante, 127 384
+produits). **Pas** sur la production.
+
+> Leçon retenue dans les tests : un script dont la portée est la table entière ne
+> peut pas être testé sur une base partagée — l'appeler depuis un test répare tout
+> ce qu'il trouve. `tests/test_reparation_prix_orphelins.py` crée donc sa propre
+> base, y joue les migrations, et la détruit.
+
+### Divers
+
+- `Decimal` au lieu de `float` pour les prix Scryfall, par cohérence avec le
+  pipeline Cardmarket qui le faisait déjà ;
+- reset de `game_changer` limité aux lignes concernées (38 907 réécrites pour 53
+  utiles) ;
+- `docs/Launch.txt` : deux informations fausses corrigées — la tâche des tags est
+  à 05:00 et non 03:00, et `docker compose run --rm updater --skip tags` ne peut
+  pas fonctionner (l'image déclare un `CMD`, Docker chercherait un binaire nommé
+  `--skip`) ;
+- le README affirmait que les tests d'intégration n'écrivent rien : c'est faux
+  depuis l'origine ;
+- `rapport_audit_hebergement.txt` déplacé dans `docs/archives/` avec un en-tête
+  qui signale ses chiffres périmés.
+
+---
+
+## [Non publié] — 2026-09-19 (5) — La base redevient reconstructible
+
+Branche `feat/p1-ci-tests`.
+
+### La CI a payé immédiatement
+
+Le premier `alembic upgrade head` sur une base **vierge** a échoué :
+
+```
+sqlalchemy.exc.ProgrammingError: table "card_pricing_rules" does not exist
+```
+
+`20260609_drop_unused_tables` supprime une table qu'**aucune migration ne crée** —
+elle n'existait que sur la base historique. La chaîne était donc injouable depuis
+zéro : impossible de monter un environnement de test, de recette, ou de
+reconstruire après un sinistre. Personne ne l'avait vu, faute d'avoir jamais
+essayé.
+
+`alembic check` a ensuite révélé un second écart : le modèle déclare un
+`server_default CURRENT_DATE` sur `scryfall_card_prices.date` qu'aucune migration
+ne pose. La base historique l'a — ajouté hors migration, comme le notait
+`docs/migrations.md` — une base reconstruite ne l'aurait pas. Les deux schémas
+divergeaient silencieusement. Migration `20260919_default_prix_date` ajoutée.
+
+> ⚠️ Au passage : l'identifiant d'une révision doit tenir dans les **32
+> caractères** de `alembic_version.version_num`. `20260826_cardmarket_id_expansion`
+> en fait exactement 32. Un identifiant trop long échoue au tout dernier `UPDATE`,
+> après que la migration a pourtant été exécutée.
+
+La CI vérifie désormais ces deux propriétés à chaque push, sur `postgres:16` —
+la version des hébergeurs visés, et non celle du poste (18.4).
+
+### Les prix Cardmarket orphelins
+
+Un produit absent du catalogue voyait son `id_product` mis à `NULL` pour esquiver
+la clé étrangère, et sa ligne de prix insérée quand même. **252 414 lignes**
+(4 % de la table) étaient dans cet état, rattachables à rien.
+
+Trois dégâts, dont un non évident : `ON CONFLICT (import_file_id, id_product)`
+cessait d'agir, puisqu'en SQL un `NULL` n'entre jamais en conflit avec un autre
+`NULL`. Rejouer le même fichier dupliquait ces lignes.
+
+Le produit manquant est désormais **créé** — ligne minimale, enrichie au prochain
+passage du Product Catalog. Le cas est fréquent : les deux fichiers sont
+téléchargés séparément, et le catalogue est souvent `skipped_not_modified` alors
+que le price guide contient déjà les nouveautés du jour.
+
+### Robustesse des téléchargements
+
+- Écriture en `.part` puis renommage atomique : un fichier tronqué ne peut plus
+  passer pour complet. Le run suivant se contentait de `dest.exists()` ;
+- contrôle de taille contre le `Content-Length` annoncé ;
+- le **sha256**, calculé mais jamais comparé alors qu'il porte une contrainte
+  d'unicité `(file_type, sha256)`, sert enfin à la déduplication qu'il permettait
+  — et cesse de provoquer une `IntegrityError` non capturée quand le `HEAD`
+  échoue et que la comparaison d'ETag est sautée ;
+- nettoyage des `cardmarket_import_files` restés `started` (une du 07/06 traînait
+  encore).
+
+### Observabilité
+
+- La ligne de progression de l'import s'affichait **0 ou 1 fois par run**, mesuré
+  sur 29 journaux consécutifs : son seuil (`cards_imported % 2_000`) supposait un
+  compteur avançant par pas de 500, alors qu'il avance d'un nombre variable.
+  Comptée en lots désormais ;
+- l'écart entre lignes lues dans le bulk et impressions écrites est tracé à
+  chaque run — c'est exactement ce chiffre qui manquait pour voir le défaut
+  corrigé en (4) ;
+- rapport de croissance de l'historique des prix, dont la rétention dépend d'un
+  script **extérieur à ce dépôt**.
+
+### Qualité
+
+Ruff était configuré mais **absent des dépendances** : le lint n'était pas
+exécutable, et le jeu de règles par défaut de l'outil varie d'une version à
+l'autre. Épinglé, avec un `select` explicite.
+
+**60 tests ajoutés** : parseurs Cardmarket et leurs 4 à 6 orthographes par champ,
+idempotence du price guide contre PostgreSQL, échec de l'étape tags, sélection
+des étapes de l'orchestrateur.
+
+---
+
+## [Non publié] — 2026-09-19 (4) — 22 037 impressions perdues à chaque run
+
+Branche `fix/p0-integrite`. Défaut le plus grave trouvé par l'audit du 19/09.
+
+### Le défaut
+
+`_flush_batch()` appliquait aux **impressions** la déduplication conçue pour les
+**cartes**. Toutes les impressions partageant un `oracle_id` à l'intérieur d'un
+même lot de 500 étaient jetées, sauf une.
+
+Mesuré en rejouant l'algorithme sur le bulk réel du 19/09 :
+
+| | Lignes |
+|---|---|
+| Lignes du bulk avec `oracle_id` | 542 827 |
+| Impressions réellement upsertées | 520 790 |
+| **Écartées** | **22 037 (4,06 %)** |
+
+Le bulk étant trié par `scryfall_id` (UUID, donc ordre pseudo-aléatoire), les
+collisions étaient fréquentes — surtout sur les terrains de base, qui comptent des
+centaines d'impressions. La base comptait **539 629** impressions contre 542 827
+dans le bulk.
+
+Rien ne le signalait : le compteur publié était celui des survivantes. La
+signature du défaut — `cards_imported == printings_imported`, égalité pourtant
+impossible pour 38 907 cartes et 539 629 impressions — figurait dans **chaque
+journal depuis l'origine**.
+
+> Effet de bord traité dans le même geste : plusieurs impressions d'une même carte
+> cohabitent désormais dans un lot, et `_replace_faces()` aurait inséré les mêmes
+> faces autant de fois. `scryfall_card_faces` n'a aucune contrainte d'unicité pour
+> l'en empêcher.
+
+### Trois façons dont un échec passait pour un succès
+
+- **Scryfall** rendait `0` en statut `partial`. Un run ayant perdu 300 000 cartes
+  produisait exactement le même signal d'exploitation qu'un run parfait ;
+- **Tagger** confondait « carte inconnue » et « Tagger en panne » sous un même
+  `return None` : le compteur d'erreurs restait à zéro même quand 100 % des
+  requêtes échouaient. L'étape ne laissait par ailleurs **aucune trace en base** —
+  rien ne disait quand les tags avaient été rafraîchis pour la dernière fois ;
+- **`update_all.py`** ne configurait aucun `logging` : les messages de
+  `mtgdb.db.lock`, dont « Verrou perdu ET repris par un autre run », partaient sur
+  stderr via le handler de dernier recours, sans jamais atteindre le fichier de
+  journal.
+
+### Garde-fou sur les downgrade destructeurs
+
+`downgrade` n'est pas un rollback sur une base partagée.
+`20260609_rename_scryfall_tables` renomme `scryfall_cards` → `cards` et casse
+instantanément les trois consommateurs ; `20260609_refactor_translations`
+détruit `printed_name`. Les deux refusent désormais de s'exécuter, sauf
+`MTGDB_ALLOW_DESTRUCTIVE_DOWNGRADE=1`.
+
+---
+
 ## [Non publié] — 2026-09-19 (3) — Le bulk n'efface plus les cardmarket_id
 
 `cardmarket_id` n'est fourni par Scryfall que sur l'impression anglaise.

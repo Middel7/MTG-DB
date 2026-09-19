@@ -4,7 +4,6 @@ Upsert dans cardmarket_products.
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
-from mtgdb.cardmarket.parsers import extract_products_list, parse_product
+from mtgdb.cardmarket.parsers import CLES_RACINE_PRODUITS, iter_json_array, parse_product
 from mtgdb.db.models.cardmarket_import_file import CardmarketImportFile
 from mtgdb.db.models.cardmarket_product import CardmarketProduct
 
@@ -28,11 +27,10 @@ def import_product_catalog(
 ) -> int:
     log.info(f"  Parsing {file_path.name} ({file_path.stat().st_size / 1_048_576:.1f} Mo)…")
 
-    with open(file_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    products = extract_products_list(data)
-    log.info(f"  {len(products):,} produits trouvés.")
+    # Streaming : `json.load()` sur ce fichier pesait 203 Mo en mémoire, la plus
+    # grosse part du pic mesuré du pipeline (350 Mo). Le compte exact n'est plus
+    # connu d'avance — c'est le prix du streaming, et il est journalisé à la fin.
+    products = iter_json_array(file_path, CLES_RACINE_PRODUITS)
 
     rows_imported = 0
     errors = 0

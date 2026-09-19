@@ -63,10 +63,15 @@ def parse_localizations(raw: dict[str, Any], id_product: int) -> list[dict[str, 
     return rows
 
 
+# Clés sous lesquelles Cardmarket a déjà livré sa liste de produits. L'ordre
+# compte : la première trouvée gagne.
+CLES_RACINE_PRODUITS = ("product", "products", "data", "singles")
+
+
 def extract_products_list(data: Any) -> list[dict]:
     if isinstance(data, list):
         return data
-    for key in ("product", "products", "data", "singles"):
+    for key in CLES_RACINE_PRODUITS:
         if isinstance(data, dict) and key in data:
             val = data[key]
             if isinstance(val, list):
@@ -111,15 +116,74 @@ def parse_price_guide_entry(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
     return row
 
 
+CLES_RACINE_PRICE_GUIDE = (
+    "priceGuides", "priceGuide", "price_guide", "product", "products", "data",
+)
+
+
 def extract_price_guide_list(data: Any) -> list[dict]:
     if isinstance(data, list):
         return data
-    for key in ("priceGuides", "priceGuide", "price_guide", "product", "products", "data"):
+    for key in CLES_RACINE_PRICE_GUIDE:
         if isinstance(data, dict) and key in data:
             val = data[key]
             if isinstance(val, list):
                 return val
     return []
+
+
+def iter_json_array(chemin, cles_racine: tuple[str, ...]):
+    """
+    Itère les objets d'un tableau JSON sans charger le fichier en mémoire.
+
+    Les deux exports Cardmarket étaient désérialisés d'un bloc par `json.load()` :
+    203 Mo des 350 Mo de pic mémoire du pipeline, pour 46 Mo de fichier. Le coût
+    est linéaire en la taille de la source, et celle-ci ne fait que croître.
+
+    `ijson` figure dans les dépendances depuis l'origine sans avoir jamais été
+    utilisé : le bulk Scryfall est passé au JSONL gzippé, qui se lit ligne à
+    ligne, et personne n'est revenu sur les fichiers Cardmarket.
+
+    La racine n'est pas connue d'avance — Cardmarket a livré tantôt un tableau
+    nu, tantôt un objet enveloppant (aujourd'hui `{"version":…, "priceGuides":[…]}`).
+    On sonde donc le premier caractère utile pour choisir le préfixe, plutôt que
+    de supposer.
+
+    `use_float=True` n'est pas un détail. Par défaut, ijson rend les nombres en
+    `Decimal` là où `json.load()` rendait des `float`, et les prix Cardmarket sont
+    des nombres JSON (`"avg":0.09`). Or l'objet brut est stocké tel quel dans la
+    colonne JSONB `raw_json`, sérialisée par `json.dumps()` — qui ne sait pas
+    écrire un `Decimal` et lève `TypeError`. Le passage au streaming aurait donc
+    fait échouer tous les imports de Price Guide, sur une ligne que rien ne
+    désignait. La précision monétaire, elle, est préservée ailleurs :
+    `_decimal_or_none()` reconstruit un `Decimal` depuis la représentation
+    textuelle, exactement comme avant.
+    """
+    import ijson
+
+    with open(chemin, "rb") as f:
+        premier = f.read(1)
+        while premier and premier.isspace():
+            premier = f.read(1)
+        f.seek(0)
+
+        if premier == b"[":
+            yield from ijson.items(f, "item", use_float=True)
+            return
+
+        # Objet enveloppant : on tente chaque clé connue, en relisant le fichier
+        # depuis le début. Le coût est négligeable — on s'arrête au premier
+        # élément trouvé, sans parcourir tout le fichier pour les clés absentes.
+        for cle in cles_racine:
+            f.seek(0)
+            elements = ijson.items(f, f"{cle}.item", use_float=True)
+            try:
+                premier_element = next(elements)
+            except StopIteration:
+                continue
+            yield premier_element
+            yield from elements
+            return
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

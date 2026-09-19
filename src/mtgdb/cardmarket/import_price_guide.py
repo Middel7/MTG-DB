@@ -4,7 +4,6 @@ Chaque import crée un snapshot historisé dans cardmarket_price_guide_entries.
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +12,11 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from mtgdb.cardmarket.parsers import extract_price_guide_list, parse_price_guide_entry
+from mtgdb.cardmarket.parsers import (
+    CLES_RACINE_PRICE_GUIDE,
+    iter_json_array,
+    parse_price_guide_entry,
+)
 from mtgdb.db.models.cardmarket_import_file import CardmarketImportFile
 from mtgdb.db.models.cardmarket_price_guide_entry import CardmarketPriceGuideEntry
 from mtgdb.db.models.cardmarket_product import CardmarketProduct
@@ -99,11 +102,9 @@ def import_price_guide(
 ) -> int:
     log.info(f"  Parsing {file_path.name} ({file_path.stat().st_size / 1_048_576:.1f} Mo)…")
 
-    with open(file_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    entries = extract_price_guide_list(data)
-    log.info(f"  {len(entries):,} entrées Price Guide trouvées.")
+    # Streaming, pour la même raison que le Product Catalog : le fichier entier
+    # ne tient plus en mémoire par principe, quelle que soit sa croissance.
+    entries = iter_json_array(file_path, CLES_RACINE_PRICE_GUIDE)
 
     captured_at = datetime.now(timezone.utc)
     rows_imported = 0

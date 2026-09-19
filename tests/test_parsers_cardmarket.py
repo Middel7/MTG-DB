@@ -15,13 +15,17 @@ Ces tests sont purs : aucune base, aucun réseau.
 """
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import pytest
 
 from mtgdb.cardmarket.parsers import (
+    CLES_RACINE_PRICE_GUIDE,
+    CLES_RACINE_PRODUITS,
     extract_price_guide_list,
     extract_products_list,
+    iter_json_array,
     parse_price_guide_entry,
     parse_product,
 )
@@ -151,3 +155,54 @@ def test_la_precision_monetaire_est_preservee():
 ])
 def test_les_enveloppes_du_price_guide(enveloppe, attendu):
     assert len(extract_price_guide_list(enveloppe)) == attendu
+
+
+# ── Lecture en streaming ──────────────────────────────────────────────────────
+
+def _ecrire(tmp_path, contenu: str):
+    chemin = tmp_path / "cardmarket.json"
+    chemin.write_text(contenu, encoding="utf-8")
+    return chemin
+
+
+def test_streaming_sur_un_tableau_nu(tmp_path):
+    fichier = _ecrire(tmp_path, '[{"idProduct": 1}, {"idProduct": 2}]')
+    assert [e["idProduct"] for e in iter_json_array(fichier, CLES_RACINE_PRODUITS)] == [1, 2]
+
+
+def test_streaming_sur_l_enveloppe_reelle_de_cardmarket(tmp_path):
+    """
+    La forme effectivement servie au 19/09/2026 :
+    `{"version":1,"createdAt":"…","priceGuides":[…]}`.
+    """
+    fichier = _ecrire(tmp_path, json.dumps(
+        {"version": 1, "createdAt": "2026-09-19T02:42:28+0200",
+         "priceGuides": [{"idProduct": 7}, {"idProduct": 8}]}))
+    trouve = [e["idProduct"] for e in iter_json_array(fichier, CLES_RACINE_PRICE_GUIDE)]
+    assert trouve == [7, 8]
+
+
+def test_streaming_sur_une_enveloppe_inconnue_ne_leve_pas(tmp_path):
+    """Mieux vaut zéro ligne importée qu'une exception au milieu d'un run."""
+    fichier = _ecrire(tmp_path, json.dumps({"autreCle": [{"idProduct": 1}]}))
+    assert list(iter_json_array(fichier, CLES_RACINE_PRICE_GUIDE)) == []
+
+
+def test_les_nombres_restent_serialisables_en_jsonb(tmp_path):
+    """
+    Le piège du passage au streaming, et il est silencieux jusqu'à l'INSERT.
+
+    Par défaut, ijson rend les nombres en `Decimal` là où `json.load()` rendait
+    des `float`. Or l'objet brut part tel quel dans la colonne JSONB `raw_json`,
+    sérialisée par `json.dumps()` — qui lève `TypeError` sur un `Decimal`. Tous
+    les imports de Price Guide auraient échoué, les prix Cardmarket étant des
+    nombres JSON (`"avg":0.09`) et non des chaînes.
+    """
+    fichier = _ecrire(tmp_path, json.dumps({"priceGuides": [{"idProduct": 1, "avg": 0.09}]}))
+    brut = next(iter(iter_json_array(fichier, CLES_RACINE_PRICE_GUIDE)))
+
+    json.dumps(brut)  # doit passer : c'est exactement ce que fait la couche JSONB
+
+    entree = parse_price_guide_entry(brut)
+    assert entree["avg_price"] == Decimal("0.09"), "la précision monétaire reste exacte"
+    assert isinstance(entree["avg_price"], Decimal)

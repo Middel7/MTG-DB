@@ -191,3 +191,56 @@ def test_les_compteurs_ne_sont_plus_egaux_par_construction(import_scryfall, espi
 
     assert (cartes, impressions) == (2, 3)
     assert cartes != impressions
+
+
+def test_le_cache_evite_de_reupserter_une_carte_deja_vue(import_scryfall, espions):
+    """
+    Déduplication GLOBALE au run, et non plus locale au lot.
+
+    Un terrain de base apparaît dans des centaines de lots. Sans cache partagé,
+    il est upserté autant de fois : la base locale cumulait 27 073 993 UPDATE
+    pour 38 907 lignes, soit 13,4 fois le travail utile, sur l'instance
+    PostgreSQL qui est déjà le goulot de la production.
+    """
+    oracle = "cccccccc-0000-0000-0000-000000000001"
+    cache: dict[str, int] = {}
+
+    premier = [_impression("aaaaaaaa-0000-0000-0000-00000000000a", oracle, lang="en")]
+    cartes_1, _ = import_scryfall._flush_batch(
+        _SessionMuette(), [import_scryfall._parse_card_row(b) for b in premier],
+        premier, date(2026, 9, 19), cache)
+
+    espions["cartes"] = []  # l'espion garde la trace du dernier appel : on repart à zéro
+    second = [_impression("bbbbbbbb-0000-0000-0000-00000000000b", oracle, lang="fr")]
+    cartes_2, impressions_2 = import_scryfall._flush_batch(
+        _SessionMuette(), [import_scryfall._parse_card_row(b) for b in second],
+        second, date(2026, 9, 19), cache)
+
+    assert cartes_1 == 1, "la carte est upsertée au premier lot"
+    assert cartes_2 == 0, "et plus jamais ensuite"
+    assert impressions_2 == 1, "mais son impression, elle, est bien écrite"
+    assert espions["cartes"] == [], "aucune carte proposée à l'upsert au second lot"
+
+
+def test_les_faces_ne_sont_rejouees_dans_aucun_lot_ulterieur(import_scryfall, espions):
+    """
+    `_replace_faces` procède par DELETE puis INSERT : le rejouer ne change rien
+    à la donnée et ne produit que des tuples morts. La table cumulait 1 152 858
+    insertions pour 1 152 808 suppressions — un remplacement intégral par run.
+    """
+    oracle = "cccccccc-0000-0000-0000-000000000002"
+    faces = [{"name": "Fire"}, {"name": "Ice"}]
+    cache: dict[str, int] = {}
+
+    lot_1 = [_impression("11111111-0000-0000-0000-00000000001a", oracle, faces=faces)]
+    import_scryfall._flush_batch(
+        _SessionMuette(), [import_scryfall._parse_card_row(b) for b in lot_1],
+        lot_1, date(2026, 9, 19), cache)
+    assert len(espions["faces"]) == 2
+
+    espions["faces"] = []
+    lot_2 = [_impression("22222222-0000-0000-0000-00000000002a", oracle, lang="de", faces=faces)]
+    import_scryfall._flush_batch(
+        _SessionMuette(), [import_scryfall._parse_card_row(b) for b in lot_2],
+        lot_2, date(2026, 9, 19), cache)
+    assert espions["faces"] == [], "les faces de cette carte ont déjà été écrites"
