@@ -1,16 +1,19 @@
-# Service de mise à jour de la base MTG-DB.
+# Service de mise à jour de la base MTG-DB — usage LOCAL.
+#
+# En production, ce n'est plus docker-compose qui déclenche les runs : deux Cron
+# Jobs Render construisent cette même image depuis le dépôt (voir render.yaml).
+# Ce fichier reste le moyen de reproduire un run de prod à l'identique sur le
+# poste, image comprise.
 #
 # Le conteneur est lancé en ONE-SHOT (il fait le job puis s'arrête). Il ne tourne
 # pas en permanence : le profil "tools" l'exclut de `docker compose up`.
 #
-#   docker compose run --rm updater                # mise à jour complète
-#   docker compose run --rm updater --skip tags    # run quotidien rapide (~7 min)
-#   docker compose run --rm updater --only tags    # run hebdomadaire des tags
-#   docker compose run --rm updater --dry-run      # plan sans exécution
+#   docker compose run --rm updater                                             # --skip tags (le CMD)
+#   docker compose run --rm updater python scripts/update_all.py --only tags    # tags
+#   docker compose run --rm updater python scripts/update_all.py --dry-run      # plan sans exécution
 #
-# Planification en production — cron de l'hôte (voir docs/deploiement.md) :
-#   0 8,20 * * *  cd /opt/mtg-db && docker compose run --rm updater --skip tags
-#   0 3   * * 0   cd /opt/mtg-db && docker compose run --rm updater --only tags
+# L'image déclare un CMD et non un ENTRYPOINT (Render ne sait remplacer que le
+# CMD) : toute variante s'écrit donc en commande complète, pas en arguments.
 
 services:
   updater:
@@ -22,11 +25,18 @@ services:
       # Fourni par l'environnement de l'hôte ou un secret — jamais commité.
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL est requis}
       TZ: ${TZ:-Europe/Paris}
+      # Le garde-fou refuse une base locale vue depuis un conteneur. Pour viser
+      # une base publiée sur l'hôte (host.docker.internal, localhost), le dire
+      # explicitement : MTGDB_ALLOW_LOCAL_DB=1 docker compose run --rm updater
+      MTGDB_ALLOW_LOCAL_DB: ${MTGDB_ALLOW_LOCAL_DB:-}
     volumes:
-      # Persiste les bulks Scryfall entre les runs : sans ce volume, chaque
-      # exécution retéléchargerait 2,4 Go depuis zéro.
+      # Persiste le bulk Scryfall entre les runs. Confort local uniquement : le
+      # retéléchargement coûte 3 s pour 393 Mo (108 Mo/s mesurés), et un Cron Job
+      # Render s'en passe — il ne peut de toute façon pas recevoir de disque.
       - scryfall_raw:/app/data
-      - ./logs:/app/logs
+    # Pas de montage de logs/ : en conteneur, update_all.py écrit sur stdout.
+    # `docker compose run` l'affiche, Render le capture.
+    #
     # Si PostgreSQL tourne dans un autre compose, rattacher son réseau ici :
     # networks:
     #   - manamind

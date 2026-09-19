@@ -1,0 +1,93 @@
+# Blueprint Render — alimentation du catalogue MTG-DB en production.
+#
+# Deux Cron Jobs construisent l'image du Dockerfile de ce dépôt et l'exécutent
+# contre la base Render `relictrade`. Plus aucun poste n'est sur le chemin de la
+# production : c'est tout l'objet de ce fichier.
+#
+# ── Mise en service ─────────────────────────────────────────────────────────
+#
+#   Dashboard Render → New → Blueprint → choisir le dépôt Middel7/MTG-DB.
+#   Render lit ce fichier et propose les deux services. Il demandera la valeur
+#   de DATABASE_URL (marquée `sync: false` : elle n'est pas dans le dépôt).
+#
+#   Coller l'URL INTERNE de la base (dashboard de la base → « Internal Database
+#   URL »), pas l'externe : elle ne sort pas du réseau Render, ne consomme pas
+#   de bande passante sortante, et évite la coupure SSL qui a fait échouer le
+#   run du 17/09 depuis le poste.
+#
+# ── Région ──────────────────────────────────────────────────────────────────
+#
+#   `frankfurt`, comme la base. Ce n'est pas un détail de confort : l'URL
+#   interne n'est joignable que depuis la MÊME région. Un job créé dans la
+#   région par défaut (Oregon) ne verrait tout simplement pas la base.
+#
+# ── Ce que ces jobs ne font pas ─────────────────────────────────────────────
+#
+#   Aucune migration Alembic. La base `relictrade` est partagée avec
+#   RELIC-Trade et porte deux chaînes de migration distinctes ; les migrations
+#   restent une opération manuelle et délibérée (voir docs/migrations.md).
+
+services:
+  # ── Run quotidien : Scryfall + Cardmarket + Game Changers ─────────────────
+  #
+  # Durée attendue : 95 à 110 min, sur la foi des huit derniers runs nocturnes
+  # (90 à 120 min depuis le poste, dont ~9 min imputables à la liaison et à la
+  # latence, que le passage en interne supprime). Render coupe un run à 12 h et
+  # retarde le suivant tant que celui-ci tourne : aucun risque de collision.
+  - name: mtgdb-catalogue-quotidien
+    type: cron
+    runtime: docker
+    region: frankfurt # IMPÉRATIF : même région que la base, sinon URL interne injoignable
+    plan: standard # 1 vCPU / 2 Go — pic mesuré du pipeline : 350 Mo
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true # un push sur main reconstruit l'image du prochain run
+    # Render interprète les expressions cron en UTC. 01:00 UTC = 02:00 à Paris
+    # l'hiver, 03:00 l'été — dans les deux cas la nuit, quand personne ne
+    # consulte le site et que l'instance n'a pas à arbitrer entre le run et les
+    # visiteurs.
+    schedule: "0 1 * * *"
+    dockerCommand: python scripts/update_all.py --skip tags
+    envVars:
+      - key: DATABASE_URL
+        sync: false # renseignée à la création : URL INTERNE de la base Render
+      # Obligatoire en production : RELIC-Trade lit ses prix dans
+      # cardmarket_price_guide_entries, jamais dans scryfall_card_prices
+      # (apps/api/AGENTS.md l'interdit explicitement). Écrire cette table
+      # coûtait ~344 000 lignes par run pour personne.
+      #
+      # ⚠️ Le flag ARRÊTE l'écriture, il ne supprime rien : la table contient
+      # 4 061 065 lignes du 07/06 au 30/08/2026, soit 738 Mo d'historique non
+      # reconstituable. Ne jamais la purger sans décision explicite.
+      - key: SKIP_SCRYFALL_PRICES
+        value: "1"
+      - key: TZ
+        value: Europe/Paris # n'affecte que l'affichage des horodatages du journal
+
+  # ── Run hebdomadaire : tags Tagger ────────────────────────────────────────
+  #
+  # Séparé du quotidien parce qu'il dure ~40 min en local et qu'il retente à
+  # chaque passage les cartes que Tagger ne connaît pas : le lancer tous les
+  # jours coûterait cher pour presque rien.
+  #
+  # 05:00 UTC le dimanche : le run quotidien démarré à 01:00 est terminé depuis
+  # longtemps. Render ne coordonne PAS deux services entre eux — c'est le verrou
+  # pg_advisory_lock, côté base, qui reste le seul filet si les deux se
+  # croisaient (le second sortirait alors en code 2 sans rien écrire).
+  - name: mtgdb-tags-hebdomadaire
+    type: cron
+    runtime: docker
+    region: frankfurt
+    plan: standard
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    schedule: "0 5 * * 0"
+    dockerCommand: python scripts/update_all.py --only tags
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SKIP_SCRYFALL_PRICES
+        value: "1"
+      - key: TZ
+        value: Europe/Paris

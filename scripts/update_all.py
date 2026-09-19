@@ -10,12 +10,14 @@ Enchaîne, dans l'ordre, toutes les sources de données du projet :
   4. Tagger tags      → ORACLE_CARD_TAG (cartes sans tags uniquement par défaut)
 
 Conçu pour tourner aussi bien à la main qu'en tâche planifiée (Planificateur
-Windows, cron, conteneur Docker) :
+Windows, cron, Cron Job Render) :
 
-  - verrou anti-chevauchement : deux runs ne peuvent pas s'écraser mutuellement
+  - verrou anti-chevauchement porté par la base (pg_advisory_lock) : deux runs
+    ne peuvent pas s'écraser mutuellement, même lancés depuis deux machines
+  - garde-fou : en conteneur, une DATABASE_URL locale est refusée avant écriture
   - idempotence : un bulk Scryfall déjà importé n'est ni retéléchargé ni re-parsé
-  - purge automatique des anciens fichiers bulk (2,4 Go pièce)
-  - journalisation dans un fichier, avec rotation
+  - purge automatique des anciens fichiers bulk (393 Mo pièce)
+  - journalisation : fichier avec rotation sur un poste, stdout en conteneur
   - codes de sortie exploitables par un superviseur
 
 Codes de sortie :
@@ -42,8 +44,10 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 # Sous Windows, la console est souvent en cp1252 : on force stdout/stderr en UTF-8
 # pour afficher sans planter les encadrés Unicode et les accents.
@@ -56,12 +60,19 @@ for _stream in (sys.stdout, sys.stderr):
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 LOG_DIR = ROOT / "logs"
-LOCK_FILE = ROOT / "data" / ".update_all.lock"
 PYTHON = sys.executable  # le même interpréteur (donc le venv actif)
 
-# Un run bloqué au-delà de ce délai est considéré comme mort : son verrou est ignoré.
-# Doit rester supérieur à la durée du run le plus long (les tags peuvent prendre ~40 min).
-LOCK_STALE_AFTER = 6 * 3600  # 6 heures
+sys.path.insert(0, str(ROOT / "src"))
+
+from mtgdb.db.engine import (  # noqa: E402 — après sys.path, comme les autres scripts
+    DATABASE_URL,
+    LocalDatabaseRefused,
+    assert_remote_database,
+)
+from mtgdb.db.lock import AdvisoryLockHeld, advisory_lock  # noqa: E402
+from mtgdb.db.urls import redact_database_url  # noqa: E402
+from mtgdb.runtime import in_container  # noqa: E402
+
 LOG_RETENTION = 30  # nombre de fichiers de log conservés
 
 # Ordre canonique des étapes. Chaque entrée : (clé, libellé, script, args de base)
@@ -126,73 +137,6 @@ def rotate_logs(log_dir: Path, keep: int = LOG_RETENTION) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Verrou anti-chevauchement
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _pid_alive(pid: int) -> bool:
-    """True si un processus portant ce PID tourne encore."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-        )
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-            return True
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-class LockHeld(Exception):
-    """Un autre run détient le verrou."""
-
-
-def acquire_lock(out: Output) -> Path | None:
-    """
-    Pose un verrou exclusif. Lève LockHeld si un run est déjà en cours.
-
-    Un verrou dont le processus est mort, ou plus vieux que LOCK_STALE_AFTER,
-    est considéré comme périmé et repris — sans quoi un crash bloquerait
-    définitivement toutes les exécutions planifiées suivantes.
-    """
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    if LOCK_FILE.exists():
-        try:
-            content = LOCK_FILE.read_text(encoding="utf-8").strip().split("\n")
-            pid = int(content[0])
-            started = float(content[1]) if len(content) > 1 else 0.0
-        except (OSError, ValueError, IndexError):
-            pid, started = -1, 0.0
-
-        age = time.time() - started
-        if _pid_alive(pid) and age < LOCK_STALE_AFTER:
-            raise LockHeld(
-                f"Un autre run est déjà en cours (PID {pid}, démarré il y a "
-                f"{int(age // 60)} min). Verrou : {LOCK_FILE}"
-            )
-        out.line(
-            f"  Verrou périmé ignoré (PID {pid}, {int(age // 60)} min) — reprise.", "yellow"
-        )
-        LOCK_FILE.unlink(missing_ok=True)
-
-    LOCK_FILE.write_text(f"{os.getpid()}\n{time.time()}\n", encoding="utf-8")
-    return LOCK_FILE
-
-
-def release_lock() -> None:
-    LOCK_FILE.unlink(missing_ok=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Exécution des étapes
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -236,7 +180,14 @@ def run_step(key: str, label: str, script: str, base_args: list[str],
     start = time.monotonic()
     # PYTHONIOENCODING=utf-8 : indispensable sous Windows pour l'affichage tqdm/accents.
     # On hérite de l'environnement courant (sinon DATABASE_URL & co disparaîtraient).
+    #
+    # DATABASE_URL est réinjectée sous sa forme NORMALISÉE : les sous-scripts la
+    # relisent chacun de leur côté, et tous n'ont pas la même porte d'entrée
+    # (import_game_changers.py lit os.environ directement). La normaliser une
+    # fois ici garantit que les quatre étapes visent la même URL, écrite pareil.
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    if DATABASE_URL:
+        env["DATABASE_URL"] = DATABASE_URL
 
     returncode = _stream_subprocess(cmd, env, out)
     duration = time.monotonic() - start
@@ -304,6 +255,44 @@ def _clean_line(line: str) -> str:
     return line.rstrip("\r").rsplit("\r", 1)[-1]
 
 
+@contextmanager
+def _lock_context(cli: argparse.Namespace, out: Output) -> Iterator[None]:
+    """
+    Enveloppe le run dans le verrou advisory, ou ne fait rien s'il est désactivé.
+
+    Le verrou n'a de sens que s'il y a quelque chose à protéger : `--dry-run`
+    n'écrit rien, et `--no-lock` est une échappatoire assumée.
+    """
+    if cli.no_lock or cli.dry_run:
+        if cli.no_lock and not cli.dry_run:
+            out.line("  ⚠ --no-lock : rien n'empêche un second run d'écrire en même temps.",
+                     "yellow")
+        yield
+        return
+
+    if not DATABASE_URL:
+        out.line("\n  ✗ DATABASE_URL absent : impossible de poser le verrou anti-chevauchement.",
+                 "red")
+        out.close()
+        sys.exit(1)
+
+    with advisory_lock(DATABASE_URL):
+        yield
+
+
+def _run_steps(steps: list[tuple], cli: argparse.Namespace, out: Output) -> list[dict]:
+    """Exécute les étapes dans l'ordre et retourne leurs résultats."""
+    results: list[dict] = []
+    total = len(steps)
+    for i, (key, label, script, base_args) in enumerate(steps, start=1):
+        res = run_step(key, label, script, base_args, cli, i, total, out)
+        results.append(res)
+        if res["status"] == "failed" and cli.stop_on_error:
+            out.line("\n  --stop-on-error : arrêt après l'échec de cette étape.", "red")
+            break
+    return results
+
+
 def select_steps(cli: argparse.Namespace) -> list[tuple]:
     keys = {s[0] for s in STEPS}
     if cli.only:
@@ -345,13 +334,16 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="Affiche le plan d'exécution sans rien lancer")
     parser.add_argument("--no-lock", action="store_true",
-                        help="Ignore le verrou anti-chevauchement (à éviter)")
+                        help="Ignore le verrou advisory anti-chevauchement (à éviter)")
     parser.add_argument("--no-log-file", action="store_true",
                         help="N'écrit pas de fichier de log")
     cli = parser.parse_args()
 
+    # En conteneur, pas de fichier de log : le disque est éphémère et meurt avec
+    # le conteneur. Render capture stdout, seule trace qui subsiste après le run.
+    containerized = in_container()
     log_path = None
-    if not cli.no_log_file and not cli.dry_run:
+    if not cli.no_log_file and not cli.dry_run and not containerized:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         log_path = LOG_DIR / f"update_{stamp}.log"
 
@@ -364,33 +356,34 @@ def main() -> None:
     out.line("╚" + "═" * 76 + "╝", "cyan")
     out.line(f"  Démarré : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     out.line(f"  {total} étape(s) : {', '.join(k for k, *_ in steps)}")
+    out.line(f"  Base    : {redact_database_url(DATABASE_URL)}", "grey")
+    if containerized:
+        out.line("  Contexte: conteneur — journal sur stdout, pas de fichier.", "grey")
     if log_path:
         out.line(f"  Journal : {log_path}", "grey")
 
-    locked = False
-    if not cli.no_lock and not cli.dry_run:
+    # Garde-fou hérité d'update-prod.ps1 : refuser une base locale en conteneur,
+    # AVANT la moindre écriture. Sans lui, un run mal configuré met à jour la
+    # base de développement et rend un rapport final tout vert.
+    if not cli.dry_run:
         try:
-            acquire_lock(out)
-            locked = True
-        except LockHeld as exc:
-            out.line(f"\n  ⚠ {exc}", "yellow")
-            out.line("  Rien à faire — sortie sans erreur applicative (code 2).", "yellow")
+            assert_remote_database()
+        except (LocalDatabaseRefused, RuntimeError) as exc:
+            out.line(f"\n  ✗ {exc}", "red")
             out.close()
-            sys.exit(2)
+            sys.exit(1)
 
     results: list[dict] = []
     global_start = time.monotonic()
 
     try:
-        for i, (key, label, script, base_args) in enumerate(steps, start=1):
-            res = run_step(key, label, script, base_args, cli, i, total, out)
-            results.append(res)
-            if res["status"] == "failed" and cli.stop_on_error:
-                out.line("\n  --stop-on-error : arrêt après l'échec de cette étape.", "red")
-                break
-    finally:
-        if locked:
-            release_lock()
+        with _lock_context(cli, out):
+            results = _run_steps(steps, cli, out)
+    except AdvisoryLockHeld as exc:
+        out.line(f"\n  ⚠ {exc}", "yellow")
+        out.line("  Rien à faire — sortie sans erreur applicative (code 2).", "yellow")
+        out.close()
+        sys.exit(2)
 
     total_duration = time.monotonic() - global_start
 

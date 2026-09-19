@@ -28,6 +28,11 @@ dependencies = [
 # installation. Les rétablir supposerait de déplacer scripts/ dans src/mtgdb/, ce que rien
 # ne justifie tant que le déclenchement passe par un ordonnanceur.
 
+# Dépendances de développement : installées par `uv sync`, exclues de l'image
+# par le `uv sync --frozen --no-dev` du Dockerfile.
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -39,3 +44,14 @@ packages = ["src/mtgdb"]
 line-length = 100
 target-version = "py312"
 src = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Les modules vivent dans src/ et le paquet n'est pas installé en editable dans
+# tous les environnements : ce chemin évite un `pip install -e .` préalable.
+pythonpath = ["src"]
+# Les tests qui ont besoin d'une vraie base PostgreSQL sont marqués `integration`
+# et se sautent d'eux-mêmes si DATABASE_URL est absent.
+markers = [
+    "integration: nécessite une base PostgreSQL accessible via DATABASE_URL",
+]
