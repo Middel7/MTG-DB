@@ -5,6 +5,64 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [Non publié] — 2026-09-20 (1) — Le catalogue sait enfin qu'une image n'est pas un scan
+
+Branche `feat/image-status`. Demandé par RELIC-Trade, dont la vitrine affichait un
+carton à la place d'une carte.
+
+### Le défaut
+
+Scryfall sert une image pour **toute** impression, y compris celles qu'il n'a
+jamais scannées : dans ce cas l'URL renvoie un carton « Localized Image Not
+Available ». Mesuré le 2026-09-20 sur Misdirection (MMQ #87) :
+
+| Impression | Réponse HTTP | Taille | `image_uris` en base | `image_status` (API Scryfall) |
+|---|---|---|---|---|
+| Anglaise | `200`, `image/jpeg` | 135 Ko | renseignée | `highres_scan` |
+| Française | `200`, `image/jpeg` | 67 Ko | renseignée | **`placeholder`** |
+
+Aucune redirection, aucune erreur, un vrai JPEG des deux côtés, et les huit
+langues de cette impression ont leurs trois colonnes `image_*` renseignées.
+**Rien dans le catalogue ne distinguait donc un scan d'un carton.** Un
+consommateur qui choisit une impression par sa langue — la vitrine « Cartes
+recherchées » de RELIC-Trade affiche le visuel dans la langue de l'interface —
+affichait le carton sans aucun moyen de s'en apercevoir : ni `404` à intercepter,
+ni champ à tester.
+
+### Ce qui change
+
+`scryfall_card_printings.image_status` porte la qualité déclarée par Scryfall
+(`highres_scan`, `lowres`, `placeholder`, `missing`). Un consommateur peut alors
+écarter les impressions sans visuel réel et replier sur une autre langue.
+
+La colonne est lue sur la **carte**, jamais sur la face : Scryfall qualifie
+l'impression entière, alors que `image_uris` peut venir d'une face (cartes double
+face). L'y lire la rendrait nulle sur toutes les DFC.
+
+⚠️ **La colonne reste `NULL` jusqu'au prochain import Scryfall.** Les
+consommateurs doivent traiter `NULL` comme « qualité inconnue » et se comporter
+comme avant — sinon, entre la migration et le réimport, ils écarteraient la
+totalité du catalogue.
+
+### Garde-fous ajoutés
+
+`tests/test_colonnes_impression_alignees.py` relie les trois déclarations qui
+décrivaient une impression **séparément** : le parseur, le modèle et la liste
+`COLONNES_IMPRESSION` que l'`UPDATE` réécrit. Rien ne les reliait, et l'oubli
+correspondant a la pire forme qui soit : une colonne absente de
+`COLONNES_IMPRESSION` est bien écrite à la **création** d'une impression — donc
+sur une base neuve et dans tous les tests — mais **jamais mise à jour** ensuite.
+Sur une production où les impressions existent déjà toutes, elle resterait vide
+indéfiniment, sans la moindre erreur.
+
+### Migration
+
+`20260920_printing_image_status` — `ADD COLUMN` NULLable, opération de métadonnée,
+sans réécriture des 542 876 impressions. Aucun index : la colonne se lit sur des
+lignes déjà sélectionnées, jamais comme critère d'entrée.
+
+---
+
 ## [Non publié] — 2026-09-19 (7) — Les upserts ne brûlent plus d'identifiants
 
 Branche `perf/consommation-sequences`. Point soulevé par les audits croisés de
