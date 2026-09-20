@@ -82,6 +82,7 @@ def flush_batch(
     today: date,
     cache_oracle: dict[str, int] | None = None,
     ecrire_prix: bool = True,
+    cartes_liees: set[int] | None = None,
 ) -> tuple[int, int]:
     """
     Écrit un lot du bulk. Retourne (cartes upsertées, impressions upsertées).
@@ -141,6 +142,11 @@ def flush_batch(
     # dont les anciennes lignes resteraient sinon en base indéfiniment.
     parts_par_carte: dict[int, list[dict]] = {}
     cartes_examinees: dict[int, None] = {}
+    # Cartes dont les liaisons ont deja ete relevees dans ce run. Partage par
+    # tous les lots, comme `cache_oracle` : une carte peut livrer ses liaisons
+    # au lot 12 apres avoir ete purgee au lot 3.
+    if cartes_liees is None:
+        cartes_liees = set()
     raw_prices: dict[str, dict] = {}
 
     for raw in raw_cards:
@@ -163,14 +169,24 @@ def flush_batch(
             faces = parse_face_rows(raw, card_id)
             if faces:
                 faces_par_carte[card_id] = faces
+        # La PURGE se decide une fois par carte : elle doit couvrir jusqu'aux
+        # cartes qui n'ont plus aucune liaison. Un dict et non une liste, car le
+        # lot contient plusieurs impressions par carte et un card_id repete
+        # gonflerait le IN du DELETE.
         if oracle_id not in deja_traitees and card_id not in cartes_examinees:
-            # Un dict et non une liste : le lot contient plusieurs impressions par
-            # carte, et un card_id répété ferait relire `all_parts` autant de fois
-            # et gonflerait inutilement le IN du DELETE.
             cartes_examinees[card_id] = None
+
+        # La COLLECTE, elle, suit l'impression qui porte le champ — et non la
+        # premiere rencontree. Scryfall ne renseigne `all_parts` que sur une
+        # partie des impressions d'une carte : mesure sur le bulk du 20/09,
+        # 3 798 des 6 986 cartes liees ont une premiere ligne qui ne le porte
+        # pas. Les lire la revenait a perdre 54 % des liaisons, silencieusement,
+        # puisque la purge avait bien eu lieu.
+        if raw.get("all_parts") and card_id not in cartes_liees:
             parts = parse_part_rows(raw, card_id)
             if parts:
                 parts_par_carte[card_id] = parts
+                cartes_liees.add(card_id)
         printing_rows.append(parse_printing_row(raw, card_id))
         raw_prices[raw["id"]] = raw.get("prices") or {}
 
@@ -178,9 +194,13 @@ def flush_batch(
         face_rows = [ligne for faces in faces_par_carte.values() for ligne in faces]
         replace_faces(session, face_rows, list(faces_par_carte))
 
-    if cartes_examinees:
+    # Le DELETE couvre les cartes purgees de ce lot ET celles dont on ecrit les
+    # liaisons : une carte purgee dans un lot anterieur reviendrait sinon avec
+    # les lignes des deux runs.
+    ids_a_purger = list(dict.fromkeys([*cartes_examinees, *parts_par_carte]))
+    if ids_a_purger:
         part_rows = [ligne for parts in parts_par_carte.values() for ligne in parts]
-        replace_parts(session, part_rows, list(cartes_examinees))
+        replace_parts(session, part_rows, ids_a_purger)
 
     scryfall_to_printing_id = upsert_printings(session, printing_rows)
 
@@ -205,6 +225,9 @@ def import_cards(file_path: Path, session: Session,
     # Partagé par tous les lots du run : c'est ce qui rend la déduplication des
     # cartes globale. ~38 900 entrées en fin de run, quelques mégaoctets.
     cache_oracle: dict[str, int] = {}
+    # Meme role que `cache_oracle`, pour les liaisons : quelques milliers
+    # d'entiers, partages par tous les lots du run.
+    cartes_liees: set[int] = set()
     cards_imported = 0
     printings_imported = 0
     errors_count = 0
@@ -248,7 +271,7 @@ def import_cards(file_path: Path, session: Session,
                     # la capture tardive que la règle signale ne peut pas se
                     # produire ici.
                     lambda: flush_batch(session, lot_cartes, lot_bruts, today,  # noqa: B023
-                                        cache_oracle, ecrire_prix),
+                                        cache_oracle, ecrire_prix, cartes_liees),
                     description=f"[BATCH] cartes {cards_imported}–{cards_imported + BATCH_SIZE}",
                     on_retry=lambda: safe_rollback(session),
                 )
@@ -281,7 +304,7 @@ def import_cards(file_path: Path, session: Session,
         try:
             c, p = retry_transient(
                 lambda: flush_batch(session, card_rows_buf, raw_cards_buf, today,
-                                     cache_oracle, ecrire_prix),
+                                     cache_oracle, ecrire_prix, cartes_liees),
                 description="[BATCH] dernier batch",
                 on_retry=lambda: safe_rollback(session),
             )

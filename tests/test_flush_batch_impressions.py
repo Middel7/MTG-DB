@@ -287,3 +287,53 @@ def test_une_carte_sans_jeton_est_quand_meme_purgee(espions):
 
     assert espions["parts"] == []
     assert espions["parts_card_ids"] == [1000], "la purge doit couvrir les cartes sans liaison"
+
+
+def test_les_jetons_se_lisent_sur_l_impression_qui_les_porte(espions):
+    """
+    Le defaut qui a coute 54 % des liaisons.
+
+    Scryfall ne renseigne `all_parts` que sur une partie des impressions d'une
+    carte. Les lire sur la PREMIERE rencontree — souvent une impression
+    etrangere qui ne le porte pas — faisait conclure que la carte n'engendre
+    rien, alors que la purge, elle, avait bien eu lieu. Mesure sur le bulk du
+    20/09/2026 : 3 798 des 6 986 cartes liees ont une premiere ligne sans le
+    champ.
+
+    Rien ne le signalait : le compteur de liaisons n'existe pas, et une carte
+    sans jeton est un cas parfaitement normal.
+    """
+    oracle = "aaaaaaaa-0000-0000-0000-000000000012"
+    jeton = {"id": "eeee5555-0000-0000-0000-00000000000e", "component": "token",
+             "name": "Treasure", "type_line": "Token Artifact — Treasure"}
+    bruts = [
+        # L'impression japonaise vient en premier et ne porte pas le champ.
+        _impression("dddd4444-0000-0000-0000-000000000004", oracle, lang="ja"),
+        _avec_parts(_impression("eeee5555-0000-0000-0000-000000000005", oracle, lang="en"),
+                    [jeton]),
+    ]
+    lignes_cartes = [parse_card_row(b) for b in bruts]
+
+    pipeline.flush_batch(_SessionMuette(), lignes_cartes, bruts, date(2026, 9, 20))
+
+    assert len(espions["parts"]) == 1, "la liaison de l'impression anglaise doit survivre"
+    assert espions["parts"][0]["part_name"] == "Treasure"
+
+
+def test_une_carte_liee_dans_un_lot_anterieur_n_est_pas_relue(espions):
+    """
+    Le cache des cartes liees vaut pour tout le run, comme celui des oracle_id :
+    une carte presente dans quarante lots ne doit livrer ses liaisons qu'une
+    fois, sinon la contrainte d'unicite de la table fait echouer le lot.
+    """
+    oracle = "aaaaaaaa-0000-0000-0000-000000000013"
+    jeton = {"id": "ffff6666-0000-0000-0000-00000000000f", "component": "token",
+             "name": "Clue"}
+    deja_liees = {1000}   # l'identifiant que l'espion attribue a la premiere carte
+    bruts = [_avec_parts(_impression("ffff6666-0000-0000-0000-000000000006", oracle), [jeton])]
+    lignes_cartes = [parse_card_row(b) for b in bruts]
+
+    pipeline.flush_batch(_SessionMuette(), lignes_cartes, bruts, date(2026, 9, 20),
+                         cartes_liees=deja_liees)
+
+    assert espions["parts"] == [], "les liaisons de cette carte ont deja ete ecrites"
