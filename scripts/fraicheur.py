@@ -97,7 +97,7 @@ def afficher_tableau(lignes: list[dict]) -> None:
     largeurs = (33, 13, 13, 13, 12, 10)
 
     print()
-    print("  " + "".join(t.ljust(w) for t, w in zip(entetes, largeurs)))
+    print("  " + "".join(t.ljust(w) for t, w in zip(entetes, largeurs, strict=True)))
     print("  " + "─" * sum(largeurs))
 
     for ligne in lignes:
@@ -111,7 +111,7 @@ def afficher_tableau(lignes: list[dict]) -> None:
             humaniser(ligne["retard"]),
             etat,
         )
-        print("  " + "".join(str(c).ljust(w) for c, w in zip(cellules, largeurs)))
+        print("  " + "".join(str(c).ljust(w) for c, w in zip(cellules, largeurs, strict=True)))
 
     print()
     print("  Vérifiée : il y a combien de temps le pipeline a interrogé la source.")

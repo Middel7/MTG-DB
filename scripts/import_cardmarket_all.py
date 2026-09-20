@@ -14,11 +14,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.cardmarket import PRICE_GUIDE_URL, PRODUCT_CATALOG_URL
 from mtgdb.cardmarket.download import download_file, marquer_imports_orphelins
-from mtgdb.db.publications import SOURCES_PAR_FILE_TYPE, marquer_publication_importee
 from mtgdb.cardmarket.import_price_guide import import_price_guide, purge_old_captures
 from mtgdb.cardmarket.import_product_catalog import import_product_catalog
 from mtgdb.cardmarket.link_scryfall import link_scryfall, rapport_croissance
 from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.db.publications import SOURCES_PAR_FILE_TYPE, marquer_publication_importee
 from mtgdb.rawfiles import purge_old_files
 
 logging.basicConfig(

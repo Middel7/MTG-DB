@@ -42,12 +42,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.db.engine import SessionLocal, check_connection, engine
-from mtgdb.db.retry import retry_transient
 from mtgdb.db.publications import (
     SOURCE_SCRYFALL_BULK,
     enregistrer_publication,
     marquer_publication_importee,
 )
+from mtgdb.db.retry import retry_transient
 from mtgdb.db.runs import finaliser_run, marquer_runs_orphelins, ouvrir_run
 from mtgdb.db.sequences import journaliser as journaliser_sequences
 from mtgdb.rawfiles import purge_old_files
