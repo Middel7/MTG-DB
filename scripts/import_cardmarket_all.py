@@ -18,6 +18,7 @@ from mtgdb.cardmarket.import_price_guide import import_price_guide, purge_old_ca
 from mtgdb.cardmarket.import_product_catalog import import_product_catalog
 from mtgdb.cardmarket.link_scryfall import link_scryfall, rapport_croissance
 from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.db.publications import SOURCES_PAR_FILE_TYPE, marquer_publication_importee
 from mtgdb.rawfiles import purge_old_files
 
 logging.basicConfig(
@@ -35,6 +36,26 @@ RAW_PRICE_DIR = ROOT / "data" / "raw" / "cardmarket" / "price_guide"
 # répertoires grossissent indéfiniment. On garde le fichier courant plus un précédent,
 # de quoi comparer deux exports en cas de doute sur un import.
 KEEP_DOWNLOADS = 2
+
+
+def tracer_absorption(import_row) -> None:
+    """
+    Note dans le suivi de fraîcheur que cette version a été absorbée.
+
+    `download_file()` couvre déjà le cas « ETag identique » — la version publiée
+    était alors absorbée de longue date. Il manquait le cas inverse, celui d'un
+    import qui vient de réussir : sans cet appel, une version fraîchement
+    importée restait affichée « EN ATTENTE » indéfiniment, et déclenchait une
+    fausse alerte au bout de six heures.
+
+    Constaté sur le run du 20/09 : le catalogue produits, importé avec succès à
+    15:28, apparaissait en retard de 3 h 26 dans `mtgdb_fraicheur_sources`.
+    """
+    if import_row is None or import_row.status != "success":
+        return
+    source = SOURCES_PAR_FILE_TYPE.get(import_row.file_type)
+    if source and import_row.etag:
+        marquer_publication_importee(source, import_row.etag)
 
 
 def main() -> None:
@@ -70,6 +91,7 @@ def main() -> None:
             )
             if path:
                 import_product_catalog(path, session, row)
+                tracer_absorption(row)
             else:
                 log.info("  Product Catalog non modifié — ignoré.")
             purge_old_files(
@@ -83,6 +105,7 @@ def main() -> None:
             )
             if path:
                 import_price_guide(path, session, row)
+                tracer_absorption(row)
             else:
                 log.info("  Price Guide non modifié — ignoré.")
             purge_old_files(

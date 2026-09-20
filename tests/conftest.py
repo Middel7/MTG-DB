@@ -38,3 +38,31 @@ def _environnement_neutre(monkeypatch):
     """
     for name in ("MTGDB_CONTAINER", "MTGDB_REQUIRE_REMOTE_DB", "MTGDB_ALLOW_LOCAL_DB", "RENDER"):
         monkeypatch.delenv(name, raising=False)
+
+@pytest.fixture
+def verrou_libre(database_url):
+    """
+    Saute le test si un run detient deja le verrou anti-chevauchement.
+
+    Les tests du verrou supposent qu'aucun import ne tourne. Lances pendant un
+    run — ce qui arrive des qu'on developpe et qu'on valide en meme temps — ils
+    echouaient tous les six, sur un message qui n'indiquait pas la vraie cause.
+    Un saut explicite vaut mieux qu'un echec trompeur.
+    """
+    from sqlalchemy import create_engine, text
+
+    from mtgdb.db.lock import UPDATE_ALL_LOCK_KEY
+
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as conn:
+            tenu = conn.execute(text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted "
+                "AND (classid::bigint << 32) | objid::bigint = :k"),
+                {"k": UPDATE_ALL_LOCK_KEY}).scalar()
+    finally:
+        engine.dispose()
+
+    if tenu:
+        pytest.skip("Un import tient le verrou : test du verrou sauté.")
+    return database_url
