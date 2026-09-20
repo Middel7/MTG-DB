@@ -27,6 +27,7 @@ from mtgdb.db.base import Base
 
 if TYPE_CHECKING:
     from mtgdb.db.models.card_face import CardFace
+    from mtgdb.db.models.card_part import CardPart
     from mtgdb.db.models.card_printing import CardPrinting
     from mtgdb.db.models.card_tag import CardTag
 
@@ -99,6 +100,9 @@ class Card(Base):
     )
     printings: Mapped[List["CardPrinting"]] = relationship(
         "CardPrinting", back_populates="card", lazy="select"
+    )
+    parts: Mapped[List["CardPart"]] = relationship(
+        "CardPart", back_populates="card", cascade="all, delete-orphan", lazy="select"
     )
     tags: Mapped[List["CardTag"]] = relationship(
         "CardTag", back_populates="card", cascade="all, delete-orphan", lazy="select"

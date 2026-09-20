@@ -1,5 +1,6 @@
 from mtgdb.db.models.card import Card
 from mtgdb.db.models.card_face import CardFace
+from mtgdb.db.models.card_part import CardPart
 from mtgdb.db.models.card_price import CardPrice
 from mtgdb.db.models.card_printing import CardPrinting
 from mtgdb.db.models.card_tag import CardTag
@@ -13,6 +14,7 @@ from mtgdb.db.models.mtg_set import MtgSet
 __all__ = [
     "Card",
     "CardFace",
+    "CardPart",
     "CardPrice",
     "CardPrinting",
     "CardTag",
