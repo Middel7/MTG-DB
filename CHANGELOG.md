@@ -5,6 +5,82 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [Non publié] — 2026-09-20 (2) — Savoir quand la source a publié, pas seulement quand on a importé
+
+Branche `feat/suivi-fraicheur-sources`.
+
+### La question posée
+
+« Quand Scryfall a-t-il proposé une mise à jour, quand Cardmarket a-t-il proposé
+la sienne, et quand MTG-DB a-t-il été mis à jour ? » Les trois réponses
+existaient en base, mais aucune n'était exploitable ensemble :
+
+| Information | Où elle était | Pourquoi inutilisable |
+|---|---|---|
+| Publication Scryfall | `import_runs.source_updated_at` | Seulement pour les versions **importées** |
+| Publication Cardmarket | `cardmarket_import_files.last_modified` | **Texte brut** (`Sun, 20 Sep 2026 00:42:36 GMT`) : ni triable ni soustrayable |
+| Version publiée non encore absorbée | nulle part | C'est pourtant le seul cas où l'on veut être alerté |
+
+### Ajouté
+
+- **Table `mtgdb_source_publications`** : une ligne par **version publiée**, pas
+  par vérification. Le pipeline passe 24 fois par jour, Scryfall publie 2 fois
+  et Cardmarket 1 — c'est la contrainte `(source, version)` qui absorbe les
+  répétitions. Préfixe `mtgdb_` parce que la base est partagée avec RELIC-Trade.
+- **Colonne `last_seen_at`**, mise à jour à chaque passage. Sans elle, rien ne
+  distingue « la source est calme » de « le cron ne tourne plus » : dans les
+  deux cas, aucune ligne nouvelle n'apparaît. L'upsert utilise `RETURNING
+  (xmax = 0)` pour distinguer une insertion d'une mise à jour, que PostgreSQL
+  ne signale pas autrement.
+- **Vue `mtgdb_fraicheur_sources`** : une ligne par source, avec le retard
+  courant. Elle unifie `mtgdb_source_publications` et `import_runs` — Tagger
+  n'ayant aucune notion de publication, son API étant interrogée en direct.
+- **`scripts/fraicheur.py`** : tableau lisible, `--historique`, `--json`, et
+  `--check` qui **sort en code 1** en cas de décrochage. Render envoyant un
+  e-mail sur échec de cron job, l'alerte fonctionne sans qu'aucun identifiant
+  SMTP n'ait à être stocké ni renouvelé.
+- **Cron `mtgdb-veille-fraicheur`**, 08:00 UTC. Trois motifs d'alerte : version
+  publiée en attente depuis plus de 6 h, source non interrogée depuis plus de
+  3 h, tags vieux de plus de 9 jours. Seuils réglables en ligne de commande.
+- 33 tests.
+
+### Modifié
+
+- **Le job catalogue passe de quotidien à horaire** (`0 * * * *`). Rendu
+  possible par les 14 min du run et par le fait que le script est déjà sa
+  propre sonde : Scryfall compare `source_file`, Cardmarket compare l'ETag par
+  un HEAD, Game Changers ne touche plus que 53 lignes. Un passage sans
+  nouveauté coûte ~40 s. Le catalogue suit désormais la source à moins d'une
+  heure, au lieu de 24 h, et ne rate plus une publication Scryfall sur deux.
+  Coût : ~24 h d'exécution par mois, sous le minimum de facturation.
+- Le service garde son nom `mtgdb-catalogue-quotidien` bien qu'il soit horaire :
+  renommer un service dans un blueprint en crée un nouveau, ce qui perdrait
+  l'historique des runs et demanderait de ressaisir `DATABASE_URL`.
+- Les tests du verrou **se sautent** au lieu d'échouer quand un import tient le
+  verrou. Lancés pendant un run, ils échouaient tous les six sur un message qui
+  ne désignait pas la cause.
+
+### Réparé au passage
+
+**L'arbre Alembic avait deux têtes.** `20260920_printing_image_status` et
+`20260920_card_parts` partageaient le parent `20260919_tagger_checked_at`.
+Conséquence : `alembic upgrade head` échoue avec « Multiple head revisions are
+present » — alors que la procédure de migration de production documentée dans
+`docs/deploiement.md` utilise précisément `head` au singulier. La divergence
+serait apparue au pire moment, en pleine mise à jour de schéma en production.
+Recousu par `20260920_merge_branches`, qui ne porte aucun changement.
+
+### Principe retenu
+
+Le suivi ne doit **jamais** faire échouer un import. Deux conséquences dans le
+code : chaque écriture de traçabilité ouvre sa **propre session** — un `commit()`
+au milieu de la transaction de `download_file()` validerait son travail à demi
+et expirerait ses objets ORM — et toute exception est avalée avec un
+avertissement. Perdre une ligne de suivi est sans gravité ; perdre un import de
+540 000 impressions ne l'est pas.
+
+---
+
 ## [Non publié] — 2026-09-20 (1) — Le catalogue sait enfin qu'une image n'est pas un scan
 
 Branche `feat/image-status`. Demandé par RELIC-Trade, dont la vitrine affichait un

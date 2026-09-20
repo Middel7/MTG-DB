@@ -56,20 +56,23 @@ en conteneur :
 
 ## Mise à jour automatique
 
-Scryfall republie son bulk **environ toutes les 12 h** : deux runs par jour sont
-donc pertinents sur la base locale. L'étape *tags* (~40 min) est traitée à part,
-une fois par semaine.
+Scryfall republie son bulk **environ toutes les 12 h**, Cardmarket son price
+guide une fois par jour. En production, le pipeline passe **toutes les heures**
+et n'importe que s'il y a du neuf : un passage à vide coûte ~40 s, puisque le
+script est sa propre sonde (comparaison de `import_runs.source_file` côté
+Scryfall, requête HEAD sur l'ETag côté Cardmarket).
 
-**En production** — deux **Cron Jobs Render** construisent le `Dockerfile` de ce
-dépôt et l'exécutent contre la base Render. Plus aucun poste n'est sur le chemin
-de la production. Tout est déclaré dans [`render.yaml`](render.yaml) : mise en
-service par *Dashboard Render → New → Blueprint*.
+**En production** — trois **Cron Jobs Render** construisent le `Dockerfile` de
+ce dépôt et l'exécutent contre la base Render. Plus aucun poste n'est sur le
+chemin de la production. Tout est déclaré dans [`render.yaml`](render.yaml) :
+mise en service par *Dashboard Render → New → Blueprint*.
 
 | Tâche | Où | Fréquence | Durée mesurée |
 |---|---|---|---|
-| Scryfall + Cardmarket + Game Changers | Render | 01:00 UTC, tous les jours | 90 à 120 min |
-| Tags Tagger | Render | 05:00 UTC, le dimanche | longue |
-| Scryfall + Cardmarket + Game Changers | poste, base locale | 08:00 et 20:00 | ~8 min 30 |
+| Scryfall + Cardmarket + Game Changers | Render | **toutes les heures** | 14 min s'il y a du neuf, ~40 s sinon |
+| Tags Tagger | Render | 05:00 UTC, le dimanche | ~39 min |
+| Veille de fraîcheur (alerte) | Render | 08:00 UTC, tous les jours | quelques secondes |
+| Scryfall + Cardmarket + Game Changers | poste, base locale | 08:00 et 20:00 | ~5 min |
 | Tags Tagger | poste, base locale | dimanche 05:00 | ~40 min |
 
 **En local (Windows)** :
@@ -85,12 +88,40 @@ service par *Dashboard Render → New → Blueprint*.
 .\update-prod.ps1 --skip tags
 ```
 
-> Un run de production dure ~2 h contre 8 min en local. Le goulot n'est ni le
-> réseau ni le disque du job, mais l'instance PostgreSQL elle-même (256 Mo de
-> RAM, 0,1 vCPU pour une base de 3,4 Go). Mesures détaillées dans
+> Un run de production prenait **2 h** le 19/09 ; il en prend **14 min** depuis
+> les optimisations d'import, sur le même plan de base. Mesures détaillées dans
 > [`docs/deploiement.md`](docs/deploiement.md).
 
 Détails, coûts, supervision : [`docs/deploiement.md`](docs/deploiement.md).
+
+---
+
+## Fraîcheur du catalogue
+
+Quand la source a-t-elle publié, et quand MTG-DB l'a-t-il absorbé ?
+
+```powershell
+.venv\Scripts\python.exe scripts\fraicheur.py               # état courant
+.venv\Scripts\python.exe scripts\fraicheur.py --historique   # dernières publications
+.venv\Scripts\python.exe scripts\fraicheur.py --check        # code 1 si décrochage
+```
+
+```
+  Source                           Vérifiée     Publiée      Absorbée     Retard    État
+  ─────────────────────────────────────────────────────────────────────────────────────────
+  Scryfall — bulk all_cards        42 min       20/09 11:17  20/09 11:31  —         à jour
+  Cardmarket — price guide         42 min       20/09 02:42  20/09 03:14  —         à jour
+  Cardmarket — catalogue produits  42 min       19/09 11:40  19/09 16:17  —         à jour
+  Scryfall Tagger — tags           9 h 44       —            20/09 07:40  —         à jour
+```
+
+Le mode `--check` tourne chaque matin sur Render et **sort en code 1** en cas de
+décrochage : Render envoie alors son e-mail d'échec, sans qu'aucun identifiant
+SMTP n'ait à être stocké. Trois motifs — une version publiée qui attend depuis
+plus de 6 h, une source qui n'est plus interrogée depuis plus de 3 h, ou des
+tags vieux de plus de 9 jours.
+
+En SQL direct : `SELECT * FROM mtgdb_fraicheur_sources;`
 
 ---
 
@@ -166,6 +197,7 @@ MTG-DB/
 ├─ .github/workflows/ci.yml    # Lint, tests, migrations sur base vierge
 ├─ scripts/
 │  ├─ update_all.py            # ★ Orchestrateur (les 4 sources)
+│  ├─ fraicheur.py             # Suivi des publications amont + alerte
 │  ├─ install_scheduled_tasks.ps1  # Tâches planifiées Windows (base locale)
 │  ├─ import_scryfall.py       # Point d'entrée Scryfall (le traitement est dans src/)
 │  ├─ import_cardmarket_all.py # Import Cardmarket complet
@@ -182,6 +214,7 @@ MTG-DB/
 │  │  ├─ engine.py             # Connexion + garde-fou "pas de base locale"
 │  │  ├─ urls.py               # Normalisation postgres:// → postgresql://
 │  │  ├─ lock.py               # Verrou anti-chevauchement (pg_advisory_lock)
+│  │  ├─ publications.py       # Ce que les sources publient, et quand
 │  │  ├─ retry.py              # Réessai sur coupure transitoire de la base
 │  │  ├─ runs.py               # Traçabilité des imports (import_runs)
 │  │  └─ models/               # modèles SQLAlchemy

@@ -17,6 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from mtgdb.db.models.cardmarket_import_file import CardmarketImportFile
+from mtgdb.db.publications import (
+    SOURCES_PAR_FILE_TYPE,
+    enregistrer_publication,
+    marquer_publication_importee,
+    parser_date_http,
+)
 
 log = logging.getLogger("cardmarket.download")
 
@@ -108,6 +114,13 @@ def download_file(
     import_row.last_modified = last_modified
     import_row.content_length = content_length
 
+    # Suivi des publications amont. L'ETag est l'identifiant de version que
+    # Cardmarket nous donne ; `last_modified` arrive en texte HTTP (« Sun, 20 Sep
+    # 2026 00:42:36 GMT ») et n'est exploitable qu'une fois converti.
+    source_suivi = SOURCES_PAR_FILE_TYPE.get(file_type)
+    if source_suivi and etag:
+        enregistrer_publication(source_suivi, etag, parser_date_http(last_modified))
+
     # Vérifier si le fichier a changé
     last = _last_successful_import(session, file_type)
     if last and etag and last.etag == etag:
@@ -115,6 +128,12 @@ def download_file(
         import_row.status = "skipped_not_modified"
         import_row.finished_at = datetime.now(timezone.utc)
         session.commit()
+        # Ce statut signifie exactement « la version publiée est déjà en base ».
+        # Le suivi doit donc la considérer absorbée, sinon la première exécution
+        # suivant la création de la table afficherait un retard imaginaire sur
+        # une version importée de longue date.
+        if source_suivi:
+            marquer_publication_importee(source_suivi, etag)
         return None, import_row
 
     # Téléchargement
