@@ -22,6 +22,7 @@ from sqlalchemy.sql import func
 
 from mtgdb.db.models.card import Card
 from mtgdb.db.models.card_face import CardFace
+from mtgdb.db.models.card_part import CardPart
 from mtgdb.db.models.card_price import CardPrice
 from mtgdb.db.models.card_printing import CardPrinting
 from mtgdb.db.models.mtg_set import MtgSet
@@ -188,6 +189,20 @@ def replace_faces(session: Session, face_rows: list[dict], card_ids: list[int]) 
     session.execute(delete(CardFace).where(CardFace.card_id.in_(card_ids)))
     if face_rows:
         session.execute(pg_insert(CardFace).values(face_rows))
+
+
+def replace_parts(session: Session, part_rows: list[dict], card_ids: list[int]) -> None:
+    """
+    Remplace les cartes liees des cartes citees.
+
+    Meme forme que `replace_faces`, et pour la meme raison : `all_parts` decrit la
+    CARTE, le bulk le repete sur chacune de ses impressions, et une liaison
+    supprimee chez Scryfall doit disparaitre ici. Le DELETE porte sur toutes les
+    cartes du lot, y compris celles qui n'ont plus aucune part.
+    """
+    session.execute(delete(CardPart).where(CardPart.card_id.in_(card_ids)))
+    if part_rows:
+        session.execute(pg_insert(CardPart).values(part_rows))
 
 
 # Colonnes que le bulk Scryfall ne renseigne que pour UNE PARTIE des impressions,

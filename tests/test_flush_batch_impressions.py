@@ -55,7 +55,8 @@ def espions(monkeypatch):
     On n'observe pas la base : ce qui est en cause est ce que `_flush_batch`
     décide d'envoyer, pas la façon dont PostgreSQL l'enregistre.
     """
-    recu: dict[str, list] = {"cartes": [], "impressions": [], "faces": [], "card_ids": []}
+    recu: dict[str, list] = {"cartes": [], "impressions": [], "faces": [], "card_ids": [],
+                             "parts": [], "parts_card_ids": []}
 
     def faux_upsert_cards(session, rows):
         recu["cartes"] = list(rows)
@@ -69,9 +70,14 @@ def espions(monkeypatch):
         recu["faces"] = list(face_rows)
         recu["card_ids"] = list(card_ids)
 
+    def fausses_parts(session, part_rows, card_ids):
+        recu["parts"] = list(part_rows)
+        recu["parts_card_ids"] = list(card_ids)
+
     monkeypatch.setattr(pipeline, "upsert_cards", faux_upsert_cards)
     monkeypatch.setattr(pipeline, "upsert_printings", faux_upsert_printings)
     monkeypatch.setattr(pipeline, "replace_faces", fausses_faces)
+    monkeypatch.setattr(pipeline, "replace_parts", fausses_parts)
     monkeypatch.setattr(pipeline, "insert_prices", lambda session, rows: None)
     return recu
 
@@ -233,3 +239,51 @@ def test_les_faces_ne_sont_rejouees_dans_aucun_lot_ulterieur(espions):
         _SessionMuette(), [parse_card_row(b) for b in lot_2],
         lot_2, date(2026, 9, 19), cache)
     assert espions["faces"] == [], "les faces de cette carte ont déjà été écrites"
+
+
+# ── Cartes liées (jetons, emblèmes, fusions) ─────────────────────────────────
+
+def _avec_parts(brut: dict, parts: list[dict]) -> dict:
+    brut["all_parts"] = parts
+    return brut
+
+
+def test_les_jetons_ne_sont_pas_dupliques_par_les_impressions_multiples(espions):
+    """
+    Même piège que les faces : `all_parts` décrit la CARTE, le bulk le répète sur
+    chaque impression. Sans garde, deux langues d'une même carte proposeraient
+    deux fois la même liaison — et la contrainte d'unicité de la table ferait
+    échouer le lot entier, pas seulement la ligne en trop.
+    """
+    oracle = "aaaaaaaa-0000-0000-0000-000000000010"
+    jeton = {"id": "99999999-0000-0000-0000-00000000000f", "component": "token",
+             "name": "Clue", "type_line": "Token Artifact — Clue"}
+    bruts = [
+        _avec_parts(_impression("aaaa1111-0000-0000-0000-000000000001", oracle, lang="en"),
+                    [jeton]),
+        _avec_parts(_impression("bbbb2222-0000-0000-0000-000000000002", oracle, lang="fr"),
+                    [jeton]),
+    ]
+    lignes_cartes = [parse_card_row(b) for b in bruts]
+
+    pipeline.flush_batch(_SessionMuette(), lignes_cartes, bruts, date(2026, 9, 20))
+
+    assert len(espions["parts"]) == 1
+    assert espions["parts"][0]["part_name"] == "Clue"
+    assert espions["parts_card_ids"] == [1000]
+
+
+def test_une_carte_sans_jeton_est_quand_meme_purgee(espions):
+    """
+    `replace_parts` doit recevoir la carte même quand elle n'a aucune liaison :
+    c'est le seul moyen d'effacer une liaison que Scryfall a retirée. Les faces
+    ont exactement ce défaut — une carte qui perd ses faces garde les anciennes.
+    """
+    oracle = "aaaaaaaa-0000-0000-0000-000000000011"
+    bruts = [_impression("cccc3333-0000-0000-0000-000000000003", oracle)]
+    lignes_cartes = [parse_card_row(b) for b in bruts]
+
+    pipeline.flush_batch(_SessionMuette(), lignes_cartes, bruts, date(2026, 9, 20))
+
+    assert espions["parts"] == []
+    assert espions["parts_card_ids"] == [1000], "la purge doit couvrir les cartes sans liaison"

@@ -101,6 +101,42 @@ def parse_face_rows(raw: dict[str, Any], card_id: int) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_part_rows(raw: dict[str, Any], card_id: int) -> list[dict[str, Any]]:
+    """
+    Traduit `all_parts` en lignes de liaison carte → carte liée.
+
+    Scryfall fait figurer la carte elle-même dans sa propre liste — une carte qui
+    engendre un jeton apparaît en `combo_piece` à côté du jeton. Cette
+    auto-référence est écartée : elle n'apprend rien et ferait compter la carte
+    parmi les objets qu'elle met en jeu.
+
+    La déduplication sur (identifiant, composant) est nécessaire et non
+    défensive : un même jeton peut être cité deux fois par des impressions
+    voisines, et la contrainte d'unicité de la table ferait échouer le lot entier.
+    """
+    parts = raw.get("all_parts") or []
+    soi = raw.get("id")
+    rows: list[dict[str, Any]] = []
+    vus: set[tuple[str, str]] = set()
+    for part in parts:
+        part_id = part.get("id")
+        component = part.get("component")
+        if not part_id or not component or part_id == soi:
+            continue
+        cle = (part_id, component)
+        if cle in vus:
+            continue
+        vus.add(cle)
+        rows.append({
+            "card_id": card_id,
+            "component": component,
+            "part_scryfall_id": part_id,
+            "part_name": part.get("name"),
+            "part_type_line": part.get("type_line"),
+        })
+    return rows
+
+
 def extract_printed_name(raw: dict[str, Any]) -> str | None:
     printed = raw.get("printed_name")
     if not printed:

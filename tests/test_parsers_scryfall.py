@@ -27,6 +27,7 @@ from mtgdb.scryfall.parsers import (
     iter_bulk_cards,
     parse_card_row,
     parse_face_rows,
+    parse_part_rows,
     parse_price_rows,
     parse_printing_row,
 )
@@ -213,3 +214,63 @@ def test_chaque_face_porte_son_propre_texte_et_ses_images():
     assert all(f["card_id"] == 42 for f in faces)
     assert faces[0]["image_small"] == "https://exemple/f.jpg"
     assert faces[1]["image_small"] is None
+
+
+# ── Cartes liées ──────────────────────────────────────────────────────────────
+
+def test_une_carte_sans_all_parts_ne_produit_aucune_liaison():
+    assert parse_part_rows({"id": "x", "name": "Forest"}, card_id=1) == []
+
+
+def test_les_jetons_sont_traduits_avec_leur_nom_et_leur_type():
+    rows = parse_part_rows({
+        "id": "source-0000",
+        "all_parts": [
+            {"id": "jeton-1111", "component": "token", "name": "Treasure",
+             "type_line": "Token Artifact — Treasure"},
+        ],
+    }, card_id=7)
+    assert rows == [{
+        "card_id": 7,
+        "component": "token",
+        "part_scryfall_id": "jeton-1111",
+        "part_name": "Treasure",
+        "part_type_line": "Token Artifact — Treasure",
+    }]
+
+
+def test_la_carte_ne_figure_pas_parmi_ses_propres_parties():
+    """
+    Scryfall fait figurer la carte elle-même dans `all_parts`, en `combo_piece`.
+    La garder reviendrait à compter la carte parmi les jetons qu'elle engendre.
+    """
+    rows = parse_part_rows({
+        "id": "source-0000",
+        "all_parts": [
+            {"id": "source-0000", "component": "combo_piece", "name": "Academy Manufactor"},
+            {"id": "jeton-2222", "component": "token", "name": "Clue"},
+        ],
+    }, card_id=3)
+    assert [r["part_scryfall_id"] for r in rows] == ["jeton-2222"]
+
+
+def test_un_meme_jeton_cite_deux_fois_n_est_retenu_qu_une_fois():
+    """La table porte une contrainte d'unicité : un doublon ferait échouer le lot."""
+    jeton = {"id": "jeton-3333", "component": "token", "name": "Soldier"}
+    rows = parse_part_rows({"id": "s", "all_parts": [jeton, dict(jeton)]}, card_id=4)
+    assert len(rows) == 1
+
+
+def test_les_parties_de_fusion_sont_conservees():
+    """
+    `meld_part` et `meld_result` viennent du même champ : les écarter obligerait
+    à relire le bulk le jour où l'on en aura besoin.
+    """
+    rows = parse_part_rows({
+        "id": "bruna",
+        "all_parts": [
+            {"id": "gisela", "component": "meld_part", "name": "Gisela"},
+            {"id": "brisela", "component": "meld_result", "name": "Brisela"},
+        ],
+    }, card_id=5)
+    assert {r["component"] for r in rows} == {"meld_part", "meld_result"}

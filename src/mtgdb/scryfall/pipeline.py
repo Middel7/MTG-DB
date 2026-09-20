@@ -28,12 +28,14 @@ from mtgdb.scryfall.parsers import (
     iter_bulk_cards,
     parse_card_row,
     parse_face_rows,
+    parse_part_rows,
     parse_price_rows,
     parse_printing_row,
 )
 from mtgdb.scryfall.upserts import (
     insert_prices,
     replace_faces,
+    replace_parts,
     upsert_cards,
     upsert_printings,
 )
@@ -132,6 +134,13 @@ def flush_batch(
 
     printing_rows: list[dict] = []
     faces_par_carte: dict[int, list[dict]] = {}
+    # Les cartes liées suivent les faces : elles décrivent la CARTE, on ne les
+    # relit donc qu'une fois par carte et par run. Deux structures et non une :
+    # `parts_par_carte` porte ce qu'il faut écrire, `cartes_examinees` porte ce
+    # qu'il faut purger — y compris les cartes qui n'ont plus aucune liaison,
+    # dont les anciennes lignes resteraient sinon en base indéfiniment.
+    parts_par_carte: dict[int, list[dict]] = {}
+    cartes_examinees: dict[int, None] = {}
     raw_prices: dict[str, dict] = {}
 
     for raw in raw_cards:
@@ -154,12 +163,24 @@ def flush_batch(
             faces = parse_face_rows(raw, card_id)
             if faces:
                 faces_par_carte[card_id] = faces
+        if oracle_id not in deja_traitees and card_id not in cartes_examinees:
+            # Un dict et non une liste : le lot contient plusieurs impressions par
+            # carte, et un card_id répété ferait relire `all_parts` autant de fois
+            # et gonflerait inutilement le IN du DELETE.
+            cartes_examinees[card_id] = None
+            parts = parse_part_rows(raw, card_id)
+            if parts:
+                parts_par_carte[card_id] = parts
         printing_rows.append(parse_printing_row(raw, card_id))
         raw_prices[raw["id"]] = raw.get("prices") or {}
 
     if faces_par_carte:
         face_rows = [ligne for faces in faces_par_carte.values() for ligne in faces]
         replace_faces(session, face_rows, list(faces_par_carte))
+
+    if cartes_examinees:
+        part_rows = [ligne for parts in parts_par_carte.values() for ligne in parts]
+        replace_parts(session, part_rows, list(cartes_examinees))
 
     scryfall_to_printing_id = upsert_printings(session, printing_rows)
 
