@@ -15,14 +15,20 @@ planifiée Windows ne vise plus la production.
 
 | Cible | Qui déclenche | Quand | Commande |
 |---|---|---|---|
-| **Production** (Render `relictrade`) | Cron Job Render `mtgdb-catalogue-quotidien` | 01:00 UTC, tous les jours | `python scripts/update_all.py --skip tags` |
+| **Production** (Render `relictrade`) | Cron Job Render `mtgdb-catalogue-quotidien` | **toutes les heures** | `python scripts/update_all.py --skip tags` |
 | **Production** | Cron Job Render `mtgdb-tags-hebdomadaire` | 05:00 UTC, le dimanche | `python scripts/update_all.py --only tags` |
+| **Production** | Cron Job Render `mtgdb-veille-fraicheur` | 08:00 UTC, tous les jours | `python scripts/fraicheur.py --check` |
 | **Locale** (`manamind`) | Planificateur Windows `MTG-DB Update` | 08:00 et 20:00 | `update.ps1 --skip tags` |
 | **Locale** | Planificateur Windows `MTG-DB Tags` | dimanche 05:00 | `update.ps1 --only tags` |
 | **Production**, secours manuel | vous | en cas d'incident Render | `.\update-prod.ps1 --skip tags` |
 
-Render interprète les expressions cron **en UTC** : 01:00 UTC = 02:00 à Paris
-l'hiver, 03:00 l'été.
+Render interprète les expressions cron **en UTC** : 05:00 UTC = 06:00 à Paris
+l'hiver, 07:00 l'été.
+
+> Le service s'appelle encore `mtgdb-catalogue-quotidien` alors qu'il passe
+> toutes les heures. Renommer un service dans un blueprint en **crée un
+> nouveau** : on perdrait l'historique des runs et il faudrait ressaisir
+> `DATABASE_URL`. Le nom reste, la planification fait foi.
 
 ---
 
@@ -301,14 +307,72 @@ base locale `manamind`, ManaMind_AI n'est **pas** présent en production.
 
 ---
 
+## Suivi de fraîcheur
+
+Trois questions que ni les logs ni `import_runs` ne couvraient ensemble : quand
+Scryfall a-t-il publié, quand Cardmarket a-t-il republié, et quand MTG-DB a-t-il
+absorbé tout cela.
+
+```powershell
+.venv\Scripts\python.exe scripts\fraicheur.py               # état courant
+.venv\Scripts\python.exe scripts\fraicheur.py --historique   # les dernières publications
+.venv\Scripts\python.exe scripts\fraicheur.py --json         # pour un script
+```
+
+```
+  Source                           Vérifiée     Publiée      Absorbée     Retard    État
+  ─────────────────────────────────────────────────────────────────────────────────────────
+  Scryfall — bulk all_cards        42 min       20/09 11:17  20/09 11:31  —         à jour
+  Cardmarket — price guide         42 min       20/09 02:42  20/09 03:14  —         à jour
+  Cardmarket — catalogue produits  42 min       19/09 11:40  19/09 16:17  —         à jour
+  Scryfall Tagger — tags           9 h 44       —            20/09 07:40  —         à jour
+```
+
+### D'où viennent ces dates
+
+| Colonne | Source | Remarque |
+|---|---|---|
+| **Vérifiée** | `mtgdb_source_publications.last_seen_at` | Mise à jour à **chaque** passage horaire, même sans nouveauté. C'est elle qui distingue « la source est calme » de « le cron ne tourne plus ». |
+| **Publiée** | `updated_at` de l'API Scryfall ; en-tête HTTP `Last-Modified` pour Cardmarket | Le `Last-Modified` est stocké en texte brut dans `cardmarket_import_files` ; le suivi en garde une version convertie, donc calculable. |
+| **Absorbée** | Renseignée à la fin d'un import **réussi** | Un run `partial` ne marque rien : la version reste en attente jusqu'à ce qu'un run la reprenne. |
+
+Une ligne par **version publiée**, jamais par vérification : le pipeline passe
+24 fois par jour, Scryfall publie 2 fois et Cardmarket 1. La contrainte
+d'unicité `(source, version)` absorbe les répétitions.
+
+Le suivi n'écrit **jamais** dans la session de l'appelant et n'échoue jamais
+bruyamment : perdre une ligne de traçabilité est sans gravité, perdre un import
+de 540 000 impressions ne l'est pas.
+
+### Alerte automatique
+
+Le cron `mtgdb-veille-fraicheur` lance `fraicheur.py --check` chaque matin. Le
+script **sort en code 1** si quelque chose décroche, et Render envoie alors son
+e-mail d'échec de cron job — aucun identifiant SMTP à stocker ni à maintenir.
+
+Trois motifs, chacun correspondant à une panne que rien d'autre ne montre :
+
+| Motif | Seuil | Ce qu'il révèle |
+|---|---|---|
+| `retard` | 6 h | Le pipeline tourne, mais n'arrive pas à absorber une version publiée. |
+| `veille` | 3 h | La source n'est plus interrogée du tout : cron arrêté, build cassé, service suspendu. |
+| `tags` | 9 jours | Le job hebdomadaire a été manqué. |
+
+Les seuils s'ajustent en ligne de commande (`--retard-max`, `--veille-max`,
+`--tags-max`) sans toucher au code.
+
+---
+
 ## Supervision
 
 Côté RELIC-Trade, `GET /health/catalog` surveille déjà la fraîcheur du catalogue
-et renvoie 503 si l'alimentation s'arrête. Rien à construire en plus.
+et renvoie 503 si l'alimentation s'arrête.
 
 Pour un diagnostic direct :
 
 ```sql
+SELECT * FROM mtgdb_fraicheur_sources;
+
 SELECT max(finished_at) AS dernier_import_reussi
 FROM import_runs
 WHERE source = 'scryfall' AND status = 'success';

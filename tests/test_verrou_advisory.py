@@ -49,7 +49,7 @@ def _verrou_tenu(engine, key: int) -> bool:
 
 
 @pytest.mark.integration
-def test_le_verrou_est_visible_puis_relache(database_url):
+def test_le_verrou_est_visible_puis_relache(database_url, verrou_libre):
     engine = create_engine(database_url)
     try:
         assert not _verrou_tenu(engine, UPDATE_ALL_LOCK_KEY), (
@@ -63,7 +63,7 @@ def test_le_verrou_est_visible_puis_relache(database_url):
 
 
 @pytest.mark.integration
-def test_un_second_preneur_se_voit_refuser(database_url):
+def test_un_second_preneur_se_voit_refuser(database_url, verrou_libre):
     with advisory_lock(database_url, heartbeat_seconds=0):
         with pytest.raises(AdvisoryLockHeld):
             with advisory_lock(database_url, heartbeat_seconds=0):
@@ -71,7 +71,7 @@ def test_un_second_preneur_se_voit_refuser(database_url):
 
 
 @pytest.mark.integration
-def test_le_verrou_est_relache_meme_sur_exception(database_url):
+def test_le_verrou_est_relache_meme_sur_exception(database_url, verrou_libre):
     engine = create_engine(database_url)
     try:
         with pytest.raises(ZeroDivisionError):
@@ -83,7 +83,7 @@ def test_le_verrou_est_relache_meme_sur_exception(database_url):
 
 
 @pytest.mark.integration
-def test_le_heartbeat_garde_la_connexion_vivante(database_url):
+def test_le_heartbeat_garde_la_connexion_vivante(database_url, verrou_libre):
     # La connexion porteuse reste ouverte jusqu'à 2 h sans échanger un octet :
     # sans trafic, un NAT ou un pare-feu la couperait en silence et PostgreSQL
     # libérerait le verrou sans que personne ne s'en aperçoive.
@@ -99,7 +99,7 @@ def test_le_heartbeat_garde_la_connexion_vivante(database_url):
 
 
 @pytest.mark.integration
-def test_update_all_sort_en_code_2_quand_le_verrou_est_tenu(database_url):
+def test_update_all_sort_en_code_2_quand_le_verrou_est_tenu(database_url, verrou_libre):
     """
     Le contrat de sortie du script, bout en bout.
 
@@ -125,7 +125,7 @@ def test_update_all_sort_en_code_2_quand_le_verrou_est_tenu(database_url):
     assert "[1/1]" not in proc.stdout
 
 @pytest.mark.integration
-def test_la_connexion_du_verrou_ne_reste_pas_en_transaction(database_url):
+def test_la_connexion_du_verrou_ne_reste_pas_en_transaction(database_url, verrou_libre):
     """
     La session porteuse doit être `idle`, jamais `idle in transaction`.
 

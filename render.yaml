@@ -28,12 +28,30 @@
 #   restent une opération manuelle et délibérée (voir docs/migrations.md).
 
 services:
-  # ── Run quotidien : Scryfall + Cardmarket + Game Changers ─────────────────
+  # ── Veille et import : Scryfall + Cardmarket + Game Changers ──────────────
   #
-  # Durée attendue : 95 à 110 min, sur la foi des huit derniers runs nocturnes
-  # (90 à 120 min depuis le poste, dont ~9 min imputables à la liaison et à la
-  # latence, que le passage en interne supprime). Render coupe un run à 12 h et
-  # retarde le suivant tant que celui-ci tourne : aucun risque de collision.
+  # ⚠️ Le nom dit « quotidien » mais le job passe TOUTES LES HEURES depuis le
+  # 20/09. Renommer un service dans un blueprint en crée un nouveau — on perdrait
+  # l'historique des runs et il faudrait ressaisir DATABASE_URL. Le nom reste
+  # donc, la planification ci-dessous fait foi.
+  #
+  # Pourquoi toutes les heures : Scryfall publie deux fois par jour (~09:18 et
+  # ~21:17 UTC) et Cardmarket une fois (~00:42 UTC). Un passage quotidien
+  # laissait le catalogue jusqu'à 24 h en retard sur la source, et ne voyait
+  # qu'une publication Scryfall sur deux.
+  #
+  # Ce que coûte un passage à vide : le script EST sa propre sonde. Scryfall
+  # compare `import_runs.source_file` et sort, Cardmarket compare l'ETag par
+  # une requête HEAD et sort, Game Changers ne touche plus que 53 lignes. Un
+  # passage sans nouveauté prend ~40 s ; seuls les deux ou trois passages
+  # quotidiens qui trouvent du neuf font le vrai travail (14 min mesurées).
+  #
+  # Coût estimé : ~48 min d'exécution par jour, soit 24 h/mois — sous le minimum
+  # de facturation de 1 $/mois par service.
+  #
+  # Render coupe un run à 12 h et retarde le suivant tant que celui-ci tourne :
+  # deux passages horaires ne peuvent pas se chevaucher. Le verrou advisory
+  # couvre le cas d'un run lancé en parallèle depuis ailleurs.
   - name: mtgdb-catalogue-quotidien
     type: cron
     runtime: docker
@@ -42,11 +60,9 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     autoDeploy: true # un push sur main reconstruit l'image du prochain run
-    # Render interprète les expressions cron en UTC. 01:00 UTC = 02:00 à Paris
-    # l'hiver, 03:00 l'été — dans les deux cas la nuit, quand personne ne
-    # consulte le site et que l'instance n'a pas à arbitrer entre le run et les
-    # visiteurs.
-    schedule: "0 1 * * *"
+    # À chaque heure pile, UTC. La nuit n'a plus d'importance : un passage à
+    # vide ne sollicite pas la base, et un import réel dure 14 min.
+    schedule: "0 * * * *"
     dockerCommand: python scripts/update_all.py --skip tags
     envVars:
       - key: DATABASE_URL
@@ -89,5 +105,41 @@ services:
         sync: false
       - key: SKIP_SCRYFALL_PRICES
         value: "1"
+      - key: TZ
+        value: Europe/Paris
+
+  # ── Veille de fraîcheur : alerte si le catalogue décroche ─────────────────
+  #
+  # Ce job ne met rien à jour. Il lit la vue `mtgdb_fraicheur_sources` et sort
+  # en code 1 si quelque chose cloche — Render envoie alors son e-mail d'échec
+  # de cron job. C'est ce qui permet d'être alerté sans stocker ni maintenir
+  # aucun identifiant SMTP.
+  #
+  # Trois motifs d'alerte, chacun correspondant à une panne que rien d'autre ne
+  # montre :
+  #
+  #   retard   une version publiée attend depuis plus de 6 h — le pipeline
+  #            tourne mais l'import échoue à l'absorber ;
+  #   veille   une source n'a plus été interrogée depuis plus de 3 h — c'est le
+  #            job horaire lui-même qui ne passe plus ;
+  #   tags     aucun import de tags réussi depuis plus de 9 jours, soit un run
+  #            hebdomadaire manqué.
+  #
+  # 08:00 UTC : le bulk Scryfall de ~21:17 la veille et le price guide de
+  # ~00:42 ont eu largement le temps d'être absorbés par les passages horaires.
+  # Alerter plus tôt produirait des faux positifs sur un simple décalage.
+  - name: mtgdb-veille-fraicheur
+    type: cron
+    runtime: docker
+    region: frankfurt
+    plan: starter # lecture d'une vue : quelques secondes, quelques Mo
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    schedule: "0 8 * * *"
+    dockerCommand: python scripts/fraicheur.py --check
+    envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: TZ
         value: Europe/Paris

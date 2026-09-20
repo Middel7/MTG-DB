@@ -44,6 +44,7 @@ Base : PostgreSQL | Hôte : localhost:5432 | Base : manamind | User : postgres
 │      border_color, frame                    │  │      image_normal     │
 │      full_art, promo, reprint, digital      │  │      image_large      │
 │      image_small/normal/large               │  └───────────────────────┘
+│      image_status (qualité du visuel)       │
 │      scryfall_uri                           │
 │      printed_name  (nom traduit, nullable)  │
 │      Source: Scryfall all_cards             │

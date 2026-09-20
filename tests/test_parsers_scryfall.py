@@ -135,6 +135,37 @@ def test_les_images_sont_reprises_de_la_premiere_face_si_absentes():
     assert ligne["image_normal"] == "https://exemple/1.jpg"
 
 
+def test_la_qualite_du_visuel_est_reprise_du_bulk():
+    """`image_status` est le SEUL champ qui distingue un scan d'un carton.
+
+    Scryfall sert une image pour toute impression : celle d'une carte qu'il n'a
+    jamais scannée est un carton « Localized Image Not Available », servi en 200
+    avec un vrai JPEG et des `image_uris` parfaitement renseignées. Sans ce champ,
+    un consommateur qui choisit une impression par sa langue ne peut pas savoir
+    qu'il affichera le carton."""
+    ligne = parse_printing_row({"id": "s", "image_status": "placeholder"}, card_id=1)
+    assert ligne["image_status"] == "placeholder"
+
+
+def test_la_qualite_du_visuel_se_lit_sur_la_carte_et_non_sur_la_face():
+    """Scryfall qualifie l'impression entière, alors que `image_uris` peut venir
+    d'une FACE (cf. les DFC ci-dessus). Lire `image_status` au même endroit que
+    les URL le rendrait nul sur toutes les cartes double face."""
+    ligne = parse_printing_row({
+        "id": "s",
+        "image_status": "highres_scan",
+        "card_faces": [{"image_uris": {"normal": "https://exemple/1.jpg"}}],
+    }, card_id=1)
+    assert ligne["image_status"] == "highres_scan"
+
+
+def test_une_qualite_de_visuel_absente_reste_nulle():
+    """Le champ manque sur les vieux bulks et sur les impressions hors-jeu : la
+    colonne est NULLable, et `NULL` doit se lire « qualité inconnue » — surtout
+    entre la migration et le premier réimport, où TOUT le catalogue est à NULL."""
+    assert parse_printing_row({"id": "s"}, card_id=1)["image_status"] is None
+
+
 def test_les_booleens_absents_valent_faux_et_non_null():
     """Les colonnes correspondantes sont `NOT NULL` : un `None` ferait échouer l'INSERT."""
     ligne = parse_printing_row({"id": "s"}, card_id=1)

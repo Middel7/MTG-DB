@@ -10,6 +10,7 @@ from mtgdb.db.models.cardmarket_product import CardmarketProduct
 from mtgdb.db.models.deck_stats import DeckStatCommander, DeckStatGlobal
 from mtgdb.db.models.import_run import ImportRun
 from mtgdb.db.models.mtg_set import MtgSet
+from mtgdb.db.models.source_publication import SourcePublication
 
 __all__ = [
     "Card",
@@ -25,4 +26,5 @@ __all__ = [
     "DeckStatGlobal",
     "ImportRun",
     "MtgSet",
+    "SourcePublication",
 ]

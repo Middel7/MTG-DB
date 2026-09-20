@@ -178,6 +178,9 @@ def parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
         "image_small": img.get("small"),
         "image_normal": img.get("normal"),
         "image_large": img.get("large"),
+        # Lu sur la CARTE, jamais sur la face : Scryfall qualifie le visuel de
+        # l'impression entière, et `image_uris` peut venir d'une face (ci-dessus).
+        "image_status": raw.get("image_status"),
         "scryfall_uri": raw.get("scryfall_uri"),
         "cardmarket_id": raw.get("cardmarket_id"),
         "tcgplayer_id": raw.get("tcgplayer_id"),

@@ -87,6 +87,16 @@ class CardPrinting(Base):
     image_small: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_normal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_large: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Qualité du visuel, telle que Scryfall la déclare : `highres_scan`, `lowres`,
+    # `placeholder` ou `missing`.
+    #
+    # ⚠️ Sans elle, RIEN ne distingue un vrai scan d'un carton « Localized Image
+    # Not Available » : les trois colonnes ci-dessus sont renseignées dans les
+    # deux cas, et l'URL répond 200 avec une vraie image JPEG. Un consommateur qui
+    # préfère l'impression d'une langue donnée — la vitrine de RELIC-Trade choisit
+    # le visuel localisé — affiche alors le carton à la place de la carte, sans
+    # aucun moyen de s'en apercevoir.
+    image_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     scryfall_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     tcgplayer_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)

@@ -42,6 +42,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mtgdb.db.engine import SessionLocal, check_connection, engine
+from mtgdb.db.publications import (
+    SOURCE_SCRYFALL_BULK,
+    enregistrer_publication,
+    marquer_publication_importee,
+)
 from mtgdb.db.retry import retry_transient
 from mtgdb.db.runs import finaliser_run, marquer_runs_orphelins, ouvrir_run
 from mtgdb.db.sequences import journaliser as journaliser_sequences
@@ -131,14 +136,26 @@ def main() -> None:
         log.info(f"  Source   : {filename}")
         log.info(f"  Scryfall : mis à jour le {source_updated_at.strftime('%Y-%m-%d %H:%M UTC')}")
 
+        # La publication est notée AVANT tout test d'idempotence, donc même
+        # lorsqu'on n'importera rien. C'est ce qui permet de répondre à « depuis
+        # combien de temps cette version attend-elle ? » plutôt qu'au seul
+        # « qu'avons-nous importé ? ».
+        if not args.dry_run:
+            enregistrer_publication(SOURCE_SCRYFALL_BULK, filename, source_updated_at)
+
         # Ce bulk est-il déjà en base ? Si oui, inutile de le retélécharger ni de le
         # re-parser : on sort en succès. C'est ce qui rend les runs planifiés répétés
-        # (2×/jour) quasi gratuits quand Scryfall n'a rien republié.
+        # (toutes les heures) quasi gratuits quand Scryfall n'a rien republié.
         if not args.dry_run and not args.force:
             with SessionLocal() as session:
                 if bulk_already_imported(session, download_uri):
                     log.info("Ce bulk a déjà été importé avec succès — rien à faire.")
                     log.info("  (--force pour réimporter malgré tout)")
+                    # Le suivi doit refléter que cette version est absorbée, même
+                    # si c'est un run antérieur qui l'a fait : sans cela, la
+                    # première exécution suivant la création de la table verrait
+                    # un retard imaginaire sur une version déjà en base.
+                    marquer_publication_importee(SOURCE_SCRYFALL_BULK, filename)
                     if not args.no_purge:
                         purge_old_files(RAW_DIR, keep=args.keep_bulks, current=filename, logger=log)
                     return
@@ -223,6 +240,13 @@ def main() -> None:
                 finaliser_run(SessionLocal, run_id, statut_final, cards=cards_n,
                               printings=printings_n, errors=errors_n,
                               on_retry=lambda: engine.dispose() if engine is not None else None)
+
+                # Uniquement sur un vrai succès : une version partiellement
+                # importée n'est pas absorbée, et le suivi doit continuer à la
+                # signaler en attente jusqu'à ce qu'un run la reprenne.
+                if statut_final == "success":
+                    marquer_publication_importee(SOURCE_SCRYFALL_BULK, filename)
+
                 if errors_n:
                     log.warning(
                         f"Run marque 'partial' : {errors_n} carte(s) perdue(s). "
