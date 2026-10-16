@@ -67,6 +67,19 @@ def test_toute_colonne_produite_par_le_parseur_existe_dans_la_table():
     )
 
 
+def test_les_finitions_suivent_les_trois_chemins():
+    """Meme garde-fou nomme que pour `image_status`, et pour la meme raison.
+
+    `finishes` est ecrit a la CREATION d'une impression. Oublie dans
+    `COLONNES_IMPRESSION`, il ne serait jamais mis a jour ensuite : vert sur une
+    base neuve et sur toute la suite de tests, vide a jamais sur une production
+    ou les 546 173 impressions existent deja. C'est exactement le scenario que
+    `scripts/backfill_finishes.py` a du rattraper."""
+    assert "finishes" in _cles_du_parseur()
+    assert "finishes" in COLONNES_IMPRESSION
+    assert "finishes" in {c.key for c in CardPrinting.__table__.columns}
+
+
 def test_la_qualite_du_visuel_suit_les_trois_chemins():
     """Cas nommé, parce que c'est celui qui a motivé ces garde-fous : sans
     `image_status`, rien ne distingue un scan d'un carton « Localized Image Not

@@ -5,6 +5,86 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [0.2.0] — 2026-10-16 — Le catalogue sait en quelles finitions une carte existe
+
+Branche `feat/finitions-impressions`.
+
+### Le défaut
+
+Rien dans le catalogue ne disait en quelles finitions une impression existe
+réellement. RELIC-Trade proposait donc « Foil / Non-foil » pour **toute** carte,
+et affichait un prix de rachat pour des versions jamais imprimées.
+
+Scryfall publie la réponse dans `finishes`. Relevé sur le bulk du 15/10, les
+60 000 premiers objets, **0 sans le champ** :
+
+| Finitions | Impressions |
+|---|---|
+| `['nonfoil', 'foil']` | 39 822 |
+| `['nonfoil']` | 17 712 |
+| `['foil']` | 1 856 |
+| `['etched']` | 498 |
+| `['nonfoil', 'foil', 'etched']` | 106 |
+
+Les booléens `foil` / `nonfoil` de l'API sont **dépréciés** et ne sont pas
+repris : ils ne savent pas exprimer « etched », et une carte uniquement etched y
+apparaît comme disponible en foil.
+
+### Ajouté
+
+- `scryfall_card_printings.finishes`, `TEXT[]` nullable. `ADD COLUMN` seul :
+  opération de métadonnée, instantanée, sans réécriture des 546 000 impressions.
+  Aucun index — la colonne se lit sur des lignes déjà sélectionnées par
+  `(set_code, collector_number)`, jamais comme critère d'entrée.
+- `scripts/backfill_finishes.py` : relit le bulk déjà téléchargé et n'écrit que
+  cette colonne. **546 173 impressions en 74 s**, second passage à 0 modification.
+  Nécessaire parce que `import_scryfall.py` s'arrête si le bulk du jour est déjà
+  importé : sans lui, la colonne resterait vide jusqu'à la publication suivante.
+- 7 tests, dont le garde-fou nommé `test_les_finitions_suivent_les_trois_chemins`.
+
+### Vérifié en base après remplissage
+
+```
+exp    #22    en  ['foil']                          ← foil uniquement
+mh2    #439   en  ['nonfoil', 'foil', 'etched']
+mh2    #439   fr  ['nonfoil', 'foil']               ← pas d'etched en français
+slu    #2     en  ['nonfoil']
+spg    #117   en  ['foil']
+```
+
+Les finitions varient **entre langues d'une même impression** : proposer les
+mêmes options pour toutes les versions était faux à deux titres.
+
+Répartition finale : 362 578 `nonfoil+foil`, 161 743 `nonfoil`, 16 581 `foil`,
+4 308 `etched`, 875 les trois, et **270 à NULL** — des impressions absentes de ce
+bulk, que le prochain import complet remplira.
+
+### ⚠️ Pour les consommateurs
+
+`NULL` signifie « finitions inconnues », **jamais** « aucune finition ». Entre la
+migration et le remplissage, tout le catalogue est à NULL : un consommateur qui
+confondrait les deux masquerait l'intégralité des cartes.
+
+Aucune colonne existante n'est modifiée ; l'ajout est rétrocompatible.
+
+### Versionnage du paquet : 0.1.0 → **0.2.0**
+
+Premier numéro qui veut dire quelque chose. La version était restée figée
+pendant que le modèle ORM gagnait `image_status`, `card_parts`,
+`tagger_checked_at` puis `finishes` — ManaMind_AI et RELIC-Trade n'avaient donc
+rien à épingler que des hashs de commit. Toute colonne ajoutée au modèle
+incrémente désormais la version mineure.
+
+### Documenté
+
+`docs/migrations.md` gagne une liste **« Ajouter une colonne au catalogue »** :
+les quatre endroits à modifier, et pourquoi oublier `COLONNES_IMPRESSION` est le
+plus pernicieux des oublis — la colonne est écrite à la création, donc verte sur
+une base neuve et dans toute la suite de tests, mais jamais mise à jour sur une
+production où les impressions existent déjà.
+
+---
+
 ## [Non publié] — 2026-09-20 (2) — Savoir quand la source a publié, pas seulement quand on a importé
 
 Branche `feat/suivi-fraicheur-sources`.

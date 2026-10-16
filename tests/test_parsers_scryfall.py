@@ -166,6 +166,50 @@ def test_une_qualite_de_visuel_absente_reste_nulle():
     assert parse_printing_row({"id": "s"}, card_id=1)["image_status"] is None
 
 
+def test_les_finitions_sont_reprises_du_bulk():
+    """`finishes` est le SEUL champ qui dise en quelles versions une impression
+    existe reellement.
+
+    Sans lui, RELIC proposait « Foil / Non-foil » pour toute carte et affichait un
+    prix de rachat pour des versions jamais imprimees. Releve en base apres
+    remplissage : Scalding Tarn existe en `['foil']` seul sur EXP #22, et en
+    `['nonfoil', 'foil', 'etched']` sur MH2 #439."""
+    ligne = parse_printing_row({"id": "s", "finishes": ["nonfoil", "foil"]}, card_id=1)
+    assert ligne["finishes"] == ["nonfoil", "foil"]
+
+
+def test_la_finition_etched_est_conservee():
+    """« etched » n'est exprimable par AUCUN des deux booleens deprecies de
+    l'API : une carte uniquement etched y apparait comme disponible en foil.
+    C'est la raison pour laquelle on lit `finishes` et pas `foil`/`nonfoil`."""
+    ligne = parse_printing_row({"id": "s", "finishes": ["etched"]}, card_id=1)
+    assert ligne["finishes"] == ["etched"]
+
+
+def test_l_ordre_des_finitions_est_celui_de_la_source():
+    """Ne pas trier : l'ordre de Scryfall est stable (nonfoil, foil, etched), et
+    le normaliser masquerait un changement d'API. Trier ferait de surcroit voir
+    comme identiques deux listes que la source distingue."""
+    ligne = parse_printing_row({"id": "s", "finishes": ["foil", "etched"]}, card_id=1)
+    assert ligne["finishes"] == ["foil", "etched"]
+
+
+def test_des_finitions_absentes_restent_nulles():
+    """NULL se lit « finitions inconnues », jamais « aucune finition ».
+
+    La distinction n'est pas theorique : entre la migration et le remplissage,
+    TOUT le catalogue est a NULL. Un consommateur qui confondrait les deux
+    masquerait l'integralite des cartes."""
+    assert parse_printing_row({"id": "s"}, card_id=1)["finishes"] is None
+
+
+def test_une_liste_de_finitions_vide_n_est_pas_nulle():
+    """Une liste vide est une reponse de la source, pas une absence de reponse :
+    la distinguer de NULL permet de voir si Scryfall se met un jour a publier des
+    impressions sans aucune finition."""
+    assert parse_printing_row({"id": "s", "finishes": []}, card_id=1)["finishes"] == []
+
+
 def test_les_booleens_absents_valent_faux_et_non_null():
     """Les colonnes correspondantes sont `NOT NULL` : un `None` ferait échouer l'INSERT."""
     ligne = parse_printing_row({"id": "s"}, card_id=1)

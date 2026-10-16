@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from mtgdb.db.base import Base
@@ -97,6 +98,24 @@ class CardPrinting(Base):
     # le visuel localisé — affiche alors le carton à la place de la carte, sans
     # aucun moyen de s'en apercevoir.
     image_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Finitions réellement disponibles pour cette impression, telles que Scryfall
+    # les publie : "nonfoil", "foil", "etched", ou plusieurs d'entre elles.
+    #
+    # Sans cette colonne, rien ne dit qu'une impression existe en foil : RELIC
+    # proposait « Foil / Non-foil » pour toute carte, et affichait un prix de
+    # rachat pour des versions qui n'existent pas.
+    #
+    # ⚠️ NULL signifie « inconnu », jamais « aucune finition » : la colonne reste
+    # vide sur les impressions non encore réimportées. Un consommateur doit donc
+    # traiter NULL comme avant — sinon, entre la migration et le réimport, il
+    # masquerait la totalité du catalogue.
+    #
+    # Les booléens `foil` / `nonfoil` de Scryfall sont dépréciés et ne sont pas
+    # repris ; ils ne savent de toute façon pas exprimer « etched ».
+    #
+    # L'ordre est celui de la source, non trié : il est stable chez Scryfall
+    # (nonfoil, foil, etched), et le normaliser masquerait un changement d'API.
+    finishes: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True)
     scryfall_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     tcgplayer_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)

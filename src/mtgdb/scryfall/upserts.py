@@ -227,7 +227,8 @@ COLONNES_IMPRESSION = (
     "oracle_id", "card_id", "set_code", "collector_number", "lang",
     "rarity", "released_at", "artist", "border_color", "frame",
     "full_art", "promo", "reprint", "digital",
-    "image_small", "image_normal", "image_large", "image_status", "scryfall_uri",
+    "image_small", "image_normal", "image_large", "image_status", "finishes",
+    "scryfall_uri",
     "cardmarket_id", "tcgplayer_id", "printed_name",
 )
 

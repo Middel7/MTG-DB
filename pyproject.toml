@@ -1,6 +1,11 @@
 [project]
 name = "mtgdb"
-version = "0.1.0"
+# 0.2.0 : premier numéro qui veut dire quelque chose. La version est restée à
+# 0.1.0 pendant que le modèle ORM gagnait image_status, card_parts,
+# tagger_checked_at et finishes — les consommateurs (ManaMind_AI, RELIC-Trade)
+# n'avaient donc rien à épingler que des hashs de commit. Toute colonne ajoutée
+# au modèle incrémente désormais la version mineure.
+version = "0.2.0"
 description = "Base de données MTG partagée — modèles SQLAlchemy, migrations Alembic, scripts d'import Scryfall"
 requires-python = ">=3.12"
 dependencies = [
