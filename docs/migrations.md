@@ -120,6 +120,32 @@ proposait de le **supprimer**. Il est désormais déclaré (`index=True`) et con
 | `20260713_rename_legacy_indexes` | Alignement des noms d'index sur les tables préfixées (voir ci-dessus) |
 | `20260824_printed_name_trgm` | Extension `pg_trgm` + index GIN trigram sur `scryfall_card_printings.printed_name`, en `CREATE INDEX CONCURRENTLY`. Recherche par nom traduit : de 645 Mo lus par requête à quelques Ko. Mesures, bench d'import et exploitation : [`recherche_trigram.md`](recherche_trigram.md) |
 | `20260824_printed_name_lower` | Index fonctionnel `lower(printed_name)` pour la résolution de decklist (261 ms → 0,0 ms), et retrait du btree `ix_scryfall_card_printings_printed_name` qu'aucun consommateur ne pouvait utiliser. Bilan : −14 Mo |
+| `20260920_printing_image_status` | `image_status` : distingue un scan d'un carton « Localized Image Not Available ». Colonne nullable, aucune réécriture |
+| `20261016_printing_finishes` | `finishes TEXT[]` : les finitions réellement imprimées (`nonfoil`, `foil`, `etched`). Colonne nullable, aucune réécriture. Remplie par [`scripts/backfill_finishes.py`](../scripts/backfill_finishes.py) — 546 173 impressions en 74 s — ou par le prochain import complet |
+
+### Ajouter une colonne au catalogue : la liste à suivre
+
+Les deux dernières migrations ont le même profil, et le même piège. Une colonne
+alimentée par le bulk Scryfall traverse **quatre** endroits, qui se déclarent
+séparément :
+
+1. le modèle `CardPrinting` — sinon l'écriture échoue à l'exécution ;
+2. `parse_printing_row()` — sinon la valeur n'est jamais lue ;
+3. **`COLONNES_IMPRESSION`** dans `upserts.py` — c'est celui qu'on oublie ;
+4. un script de rattrapage, car `import_scryfall.py` s'arrête si le bulk du jour
+   est déjà importé, et la colonne resterait vide jusqu'à la publication suivante.
+
+Oublier le point 3 se comporte de la pire façon possible : la colonne est bien
+écrite à la **création** d'une impression, donc tout est vert sur une base neuve
+et dans toute la suite de tests — mais elle n'est **jamais mise à jour** ensuite.
+Sur une production où les 546 000 impressions existent déjà, elle reste vide
+indéfiniment, sans la moindre erreur.
+
+`tests/test_colonnes_impression_alignees.py` verrouille les points 1 à 3.
+
+> ⚠️ Ces colonnes restent **NULL jusqu'au remplissage**. Les consommateurs
+> doivent traiter `NULL` comme « inconnu » et se comporter comme avant — sinon,
+> entre la migration et le rattrapage, ils masqueraient la totalité du catalogue.
 
 > Ces deux migrations sont les premières du dépôt à sortir de la transaction
 > (`autocommit_block`) et à se garder sur `pg_index.indisvalid` pour rester rejouables :
