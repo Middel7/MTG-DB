@@ -45,7 +45,8 @@ l'hiver, 07:00 l'été.
 | **Reprise sur coupure** | Une interruption transitoire de la base (recovery, SSL coupé, connexion refusée) déclenche jusqu'à 5 réessais espacés de 5 s à 2 min, avec recyclage du pool. Les erreurs de données, elles, ne sont jamais rejouées. |
 | **Statut honnête** | Un run qui a perdu des cartes est marqué `partial`, pas `success` : le bulk sera repris au run suivant et la supervision voit le décrochage. |
 | **Runs orphelins** | Un run resté `running` depuis plus de 6 h est marqué `failed` par le run suivant. |
-| **Codes de sortie** | `0` succès · `1` au moins une étape en échec · `2` un run est déjà en cours. |
+| **Schéma vérifié au démarrage** | Si la base est en retard sur les migrations du code, le run **refuse de commencer** (code 3) plutôt que d'échouer au milieu sur un `UndefinedColumn`. |
+| **Codes de sortie** | `0` succès · `1` au moins une étape en échec · `2` un run est déjà en cours · `3` migration manquante. |
 
 ---
 
