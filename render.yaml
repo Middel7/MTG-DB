@@ -86,10 +86,19 @@ services:
   # chaque passage les cartes que Tagger ne connaît pas : le lancer tous les
   # jours coûterait cher pour presque rien.
   #
-  # 05:00 UTC le dimanche : le run quotidien démarré à 01:00 est terminé depuis
-  # longtemps. Render ne coordonne PAS deux services entre eux — c'est le verrou
-  # pg_advisory_lock, côté base, qui reste le seul filet si les deux se
-  # croisaient (le second sortirait alors en code 2 sans rien écrire).
+  # ⚠️ 05:30 ET NON 05:00, et --attendre-verrou : correctif d'une collision
+  # constatée en production.
+  #
+  # Le job de catalogue passe toutes les heures, donc à 05:00 pile lui aussi.
+  # Les deux démarraient à la même seconde ; celui qui perdait la course au
+  # verrou advisory sortait en code 2, que Render rapporte comme un échec. Les
+  # tags n'ont plus été rafraîchis du 04/10 au 03/11 — un run hebdomadaire qui
+  # renonce perd sa semaine, là où un run horaire retrouve sa place dans l'heure.
+  #
+  # Deux protections plutôt qu'une : la minute 30 écarte le croisement nominal
+  # (un passage de catalogue à vide dure ~40 s, un import complet ~18 min), et
+  # les 900 s d'attente couvrent le cas où un import déborderait malgré tout.
+  #
   - name: mtgdb-tags-hebdomadaire
     type: cron
     runtime: docker
@@ -98,8 +107,8 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     autoDeploy: true
-    schedule: "0 5 * * 0"
-    dockerCommand: python scripts/update_all.py --only tags
+    schedule: "30 5 * * 0"
+    dockerCommand: python scripts/update_all.py --only tags --attendre-verrou 900
     envVars:
       - key: DATABASE_URL
         sync: false

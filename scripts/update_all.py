@@ -400,7 +400,7 @@ def _lock_context(cli: argparse.Namespace, out: Output) -> Iterator[None]:
         out.close()
         sys.exit(1)
 
-    with advisory_lock(DATABASE_URL):
+    with advisory_lock(DATABASE_URL, attente_max_s=cli.attendre_verrou):
         yield
 
 
@@ -458,6 +458,12 @@ def main() -> None:
                         help="Arrête dès qu'une étape échoue")
     parser.add_argument("--dry-run", action="store_true",
                         help="Affiche le plan d'exécution sans rien lancer")
+    parser.add_argument("--attendre-verrou", type=float, default=0.0, metavar="SECONDES",
+                        dest="attendre_verrou",
+                        help="Si un autre run détient le verrou, réessayer pendant N "
+                             "secondes au lieu d'abandonner. À réserver aux runs RARES : "
+                             "un run horaire qui renonce retrouvera sa place dans l'heure, "
+                             "un run hebdomadaire perd sa semaine.")
     parser.add_argument("--no-lock", action="store_true",
                         help="Ignore le verrou advisory anti-chevauchement (à éviter)")
     parser.add_argument("--no-log-file", action="store_true",

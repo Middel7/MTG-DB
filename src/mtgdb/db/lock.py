@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -44,6 +45,9 @@ log = logging.getLogger("mtgdb.db.lock")
 # survivre à un changement de version de Python ou d'algorithme de hachage, sinon
 # deux runs d'âges différents cesseraient silencieusement de se voir.
 UPDATE_ALL_LOCK_KEY = 5713668333999869625
+
+# Intervalle entre deux tentatives quand `attente_max_s` est demandé.
+_INTERVALLE_SONDAGE_S = 10.0
 
 # TCP keepalives : la connexion qui porte le verrou reste ouverte pendant toute
 # la durée du run (jusqu'à 2 h mesurées) sans échanger un octet. Un routeur, un
@@ -187,12 +191,39 @@ class _Heartbeat:
                 return
 
 
+def _acquerir(holder: "_LockHolder", key: int, attente_max_s: float) -> bool:
+    """
+    Tente de prendre le verrou, en réessayant jusqu'à `attente_max_s`.
+
+    Sondage toutes les 10 s plutôt que `pg_advisory_lock` bloquant : une attente
+    côté serveur immobiliserait une connexion sans qu'on puisse la borner ni la
+    journaliser, et un run qui semble figé sans rien dire est le pire des cas
+    pour qui lit les logs à distance.
+    """
+    if holder.try_acquire():
+        return True
+    if attente_max_s <= 0:
+        return False
+
+    limite = time.monotonic() + attente_max_s
+    log.warning(
+        "Verrou %s déjà détenu — nouvelle tentative pendant %d s au plus.",
+        key, int(attente_max_s))
+    while time.monotonic() < limite:
+        time.sleep(min(_INTERVALLE_SONDAGE_S, max(0.0, limite - time.monotonic())))
+        if holder.try_acquire():
+            log.info("Verrou obtenu après attente.")
+            return True
+    return False
+
+
 @contextmanager
 def advisory_lock(
     database_url: str,
     key: int = UPDATE_ALL_LOCK_KEY,
     *,
     heartbeat_seconds: float = 60.0,
+    attente_max_s: float = 0.0,
 ) -> Iterator[int]:
     """
     Prend un verrou consultatif de session sur la base visée.
@@ -204,6 +235,21 @@ def advisory_lock(
     `pg_try_advisory_lock` et non `pg_advisory_lock` : on veut savoir tout de
     suite qu'un run tourne déjà, pas attendre son tour pendant deux heures pour
     refaire le même travail juste après.
+
+    `attente_max_s` NUANCE CELA POUR LES RUNS RARES
+    --------------------------------------------
+    Abandonner tout de suite est le bon comportement d'un run qui repasse dans
+    l'heure : le travail sera fait au passage suivant. C'est le mauvais pour un
+    run HEBDOMADAIRE, qui perd alors sa semaine.
+
+    Constaté en production : le job de tags (dimanche 05:00 UTC) et le job de
+    catalogue (toutes les heures, donc 05:00 aussi) démarrent à la même seconde.
+    Celui qui perd la course sort en code 2 — que Render rapporte comme un échec.
+    Les tags n'ont plus été rafraîchis du 04/10 au 03/11.
+
+    Avec `attente_max_s`, le second réessaie posément au lieu de renoncer. Un
+    passage de catalogue à vide dure ~40 s, un import complet ~18 min : quelques
+    minutes d'attente suffisent à couvrir les deux.
     """
     engine = create_engine(
         database_url,
@@ -214,10 +260,11 @@ def advisory_lock(
     holder = _LockHolder(engine, key)
     heartbeat: _Heartbeat | None = None
     try:
-        if not holder.try_acquire():
+        if not _acquerir(holder, key, attente_max_s):
+            attendu = f" après {int(attente_max_s)} s d'attente" if attente_max_s else ""
             raise AdvisoryLockHeld(
-                f"Un autre run détient déjà le verrou {key} sur cette base "
-                f"(pg_try_advisory_lock). Il peut venir d'une autre machine."
+                f"Un autre run détient déjà le verrou {key} sur cette base"
+                f"{attendu} (pg_try_advisory_lock). Il peut venir d'une autre machine."
             )
 
         if heartbeat_seconds > 0:
