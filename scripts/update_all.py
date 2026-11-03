@@ -74,7 +74,11 @@ from mtgdb.db.engine import (  # noqa: E402 — après sys.path, comme les autre
     SessionLocal,
     assert_remote_database,
 )
-from mtgdb.db.lock import AdvisoryLockHeld, advisory_lock  # noqa: E402
+from mtgdb.db.lock import (  # noqa: E402
+    VARIABLE_VERROU_DETENU,
+    AdvisoryLockHeld,
+    advisory_lock,
+)
 from mtgdb.db.schema_version import CODE_EN_AVANCE, verifier_schema  # noqa: E402
 from mtgdb.db.urls import redact_database_url  # noqa: E402
 from mtgdb.runtime import in_container  # noqa: E402
@@ -248,6 +252,11 @@ def run_step(key: str, label: str, script: str, base_args: list[str], timeout: f
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     if DATABASE_URL:
         env["DATABASE_URL"] = DATABASE_URL
+    # Nous détenons déjà le verrou pour toute la durée du run : sans ce signal,
+    # chaque sous-processus tenterait de le reprendre dans sa propre session
+    # PostgreSQL et se bloquerait lui-même.
+    if not cli.no_lock and not cli.dry_run:
+        env[VARIABLE_VERROU_DETENU] = "1"
 
     returncode = _stream_subprocess(cmd, env, out, timeout=timeout)
     duration = time.monotonic() - start

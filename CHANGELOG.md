@@ -5,6 +5,68 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [0.3.3] — 2026-11-03 — Le verrou protège aussi les appels directs aux scripts
+
+Branche `fix/verrou-scripts-individuels`.
+
+### Le défaut, constaté en se le faisant soi-même
+
+Le verrou `pg_advisory_lock` ne couvrait que `update_all.py`. Les scripts
+d'import appelés **directement** — ce qu'on fait en dépannage — écrivaient sans
+lui.
+
+Le 03/11, un `import_scryfall.py --force` lancé à la main depuis le poste pour
+remplir `illustration_id` a tourné **deux heures en parallèle du cron horaire**.
+Les deux écrivaient sur `scryfall_card_printings` :
+
+| | |
+|---|---|
+| Run manuel (#233) | 10:20 → 12:17, **43 000 erreurs**, statut `partial` |
+| Cron (#234) | démarré à 11:02, pendant le précédent |
+
+Aucune donnée corrompue — les upserts sont idempotents et la colonne a atteint
+99,81 % — mais deux heures pour un résultat qu'un seul run aurait produit
+proprement.
+
+**Un verrou qui ne protège que celui qui pense à le prendre ne protège rien.**
+
+### Le correctif
+
+`verrou_si_autonome()` dans `mtgdb.db.lock`, appelé par les trois scripts qui
+écrivent massivement : `import_scryfall.py`, `import_cardmarket_all.py`,
+`import_tagger_tags.py`. Lancés à la main pendant un run, ils sortent désormais
+en **code 2** au lieu d'écrire en parallèle.
+
+`import_game_changers.py` en est exclu : il ne touche que 53 lignes, par un
+UPDATE unique et atomique.
+
+### Le piège évité
+
+Si chaque script prenait le verrou sans condition, `update_all.py` **se
+bloquerait lui-même** : il le détient déjà, et chaque sous-processus tenterait
+de le reprendre dans une autre session PostgreSQL.
+
+D'où `MTGDB_VERROU_DETENU`, posée par l'orchestrateur dans l'environnement de
+ses sous-processus. Les deux chemins ont été vérifiés : un script seul refuse
+de tourner si le verrou est pris, et `update_all.py --only cardmarket` passe
+normalement.
+
+### La pile reste ouverte
+
+Le verrou est pris par un `ExitStack` qu'on ne referme pas avant la fin du
+processus, avec un `atexit` par propreté. PostgreSQL libère de toute façon le
+verrou à la déconnexion, y compris si le script meurt brutalement — c'est
+l'avantage d'un verrou de session sur un verrou fichier.
+
+### Tests
+
+6 nouveaux, dont un **garde-fou statique** : il lit le source des trois scripts
+et échoue si l'un d'eux perd son appel au verrou. Sans base ni réseau, il
+protège contre la régression la plus probable — un script d'import ajouté plus
+tard sans y penser.
+
+---
+
 ## [0.3.2] — 2026-11-03 — Un run refuse de démarrer si sa migration manque
 
 Branche `feat/garde-fou-schema`.
