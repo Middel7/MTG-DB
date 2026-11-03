@@ -33,9 +33,11 @@ script sortait en succès après 40 minutes de travail perdu.
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -49,7 +51,8 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mtgdb.db.engine import SessionLocal, check_connection
+from mtgdb.db.engine import DATABASE_URL, SessionLocal, check_connection
+from mtgdb.db.lock import AdvisoryLockHeld, verrou_si_autonome
 from mtgdb.db.models.card_tag import CardTag
 from mtgdb.db.runs import finaliser_run, marquer_runs_orphelins, ouvrir_run
 
@@ -319,6 +322,23 @@ def main() -> None:
     if not check_connection():
         log.error("Impossible de se connecter à la base de données.")
         sys.exit(1)
+
+    # Le verrou protège aussi les appels DIRECTS à ce script, pas seulement les
+    # runs passant par update_all.py. Un import lancé à la main pendant que le
+    # cron horaire tourne écrivait sur les mêmes tables : constaté le 03/11,
+    # 43 000 erreurs et un run `partial` pour un travail qu'un seul passage
+    # aurait fait proprement.
+    #
+    # La pile reste ouverte jusqu'à la fin du processus ; PostgreSQL libère le
+    # verrou à la déconnexion, y compris si le script meurt brutalement.
+    _verrou = ExitStack()
+    atexit.register(_verrou.close)
+    try:
+        _verrou.enter_context(verrou_si_autonome(DATABASE_URL or ""))
+    except AdvisoryLockHeld as exc:
+        log.warning("%s", exc)
+        log.warning("Rien à faire — sortie sans erreur applicative (code 2).")
+        sys.exit(2)
 
     total_tags = 0
     errors = 0

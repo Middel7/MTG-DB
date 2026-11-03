@@ -5,7 +5,7 @@ name = "mtgdb"
 # tagger_checked_at et finishes — les consommateurs (ManaMind_AI, RELIC-Trade)
 # n'avaient donc rien à épingler que des hashs de commit. Toute colonne ajoutée
 # au modèle incrémente désormais la version mineure.
-version = "0.3.2"
+version = "0.3.3"
 description = "Base de données MTG partagée — modèles SQLAlchemy, migrations Alembic, scripts d'import Scryfall"
 requires-python = ">=3.12"
 dependencies = [

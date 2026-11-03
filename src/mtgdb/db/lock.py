@@ -32,6 +32,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from mtgdb.db.retry import is_transient_error
+from mtgdb.runtime import env_flag
 
 log = logging.getLogger("mtgdb.db.lock")
 
@@ -215,6 +216,43 @@ def _acquerir(holder: "_LockHolder", key: int, attente_max_s: float) -> bool:
             log.info("Verrou obtenu après attente.")
             return True
     return False
+
+
+# Posée par `scripts/update_all.py` dans l'environnement de ses sous-processus.
+# Sans elle, chaque script d'import prendrait le verrou que l'orchestrateur
+# détient déjà, et se bloquerait lui-même.
+VARIABLE_VERROU_DETENU = "MTGDB_VERROU_DETENU"
+
+
+@contextmanager
+def verrou_si_autonome(
+    database_url: str,
+    *,
+    attente_max_s: float = 0.0,
+) -> Iterator[int | None]:
+    """
+    Prend le verrou, sauf si l'orchestrateur le détient déjà pour nous.
+
+    POURQUOI CE DÉTOUR
+    Le verrou ne protégeait que `update_all.py`. Les quatre scripts d'import,
+    appelés directement — ce que l'on fait en dépannage —, écrivaient sans lui.
+
+    Constaté le 03/11 : un `import_scryfall.py --force` lancé à la main depuis
+    le poste a tourné pendant deux heures en parallèle du cron horaire. Les deux
+    écrivaient sur `scryfall_card_printings` ; le run manuel s'est terminé avec
+    **43 000 erreurs** et le statut `partial`. Aucune donnée corrompue, les
+    upserts étant idempotents, mais deux heures pour un résultat qu'un seul run
+    aurait produit proprement.
+
+    Un verrou qui ne protège que celui qui pense à le prendre ne protège rien.
+    """
+    if env_flag(VARIABLE_VERROU_DETENU):
+        # L'orchestrateur l'a pris avant de nous lancer : le reprendre ici
+        # échouerait, puisque c'est une autre session PostgreSQL.
+        yield None
+        return
+    with advisory_lock(database_url, attente_max_s=attente_max_s) as cle:
+        yield cle
 
 
 @contextmanager

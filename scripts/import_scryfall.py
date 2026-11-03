@@ -30,8 +30,10 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,7 +43,8 @@ from sqlalchemy import text as sa_text
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mtgdb.db.engine import SessionLocal, check_connection, engine
+from mtgdb.db.engine import DATABASE_URL, SessionLocal, check_connection, engine
+from mtgdb.db.lock import AdvisoryLockHeld, verrou_si_autonome
 from mtgdb.db.publications import (
     SOURCE_SCRYFALL_BULK,
     enregistrer_publication,
@@ -119,6 +122,23 @@ def main() -> None:
     if not args.dry_run and not check_connection():
         log.error("Connexion PostgreSQL impossible. Vérifier DATABASE_URL dans .env.")
         sys.exit(1)
+
+    # Le verrou protège aussi les appels DIRECTS à ce script, pas seulement les
+    # runs passant par update_all.py. Un import lancé à la main pendant que le
+    # cron horaire tourne écrivait sur les mêmes tables : constaté le 03/11,
+    # 43 000 erreurs et un run `partial` pour un travail qu'un seul passage
+    # aurait fait proprement.
+    #
+    # La pile reste ouverte jusqu'à la fin du processus ; PostgreSQL libère le
+    # verrou à la déconnexion, y compris si le script meurt brutalement.
+    _verrou = ExitStack()
+    atexit.register(_verrou.close)
+    try:
+        _verrou.enter_context(verrou_si_autonome(DATABASE_URL or ""))
+    except AdvisoryLockHeld as exc:
+        log.warning("%s", exc)
+        log.warning("Rien à faire — sortie sans erreur applicative (code 2).")
+        sys.exit(2)
 
     with httpx.Client(
         timeout=httpx.Timeout(30.0, read=300.0),
