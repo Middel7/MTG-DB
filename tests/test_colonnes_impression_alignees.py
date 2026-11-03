@@ -67,6 +67,18 @@ def test_toute_colonne_produite_par_le_parseur_existe_dans_la_table():
     )
 
 
+def test_l_illustration_suit_les_trois_chemins():
+    """Troisieme colonne a suivre ce garde-fou, apres image_status et finishes.
+
+    C'est l'oubli dans `COLONNES_IMPRESSION` qui coute le plus cher : la colonne
+    serait ecrite a la CREATION d'une impression -- donc verte sur une base
+    neuve et dans toute la suite de tests -- mais jamais mise a jour sur une
+    production ou les 548 000 impressions existent deja."""
+    assert "illustration_id" in _cles_du_parseur()
+    assert "illustration_id" in COLONNES_IMPRESSION
+    assert "illustration_id" in {c.key for c in CardPrinting.__table__.columns}
+
+
 def test_les_finitions_suivent_les_trois_chemins():
     """Meme garde-fou nomme que pour `image_status`, et pour la meme raison.
 

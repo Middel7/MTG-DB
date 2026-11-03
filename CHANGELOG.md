@@ -5,6 +5,89 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [0.3.0] — 2026-11-03 — Regrouper les éditions qui partagent la même illustration
+
+Branche `feat/illustration-id`. Demandé par ManaMind.
+
+### Le besoin
+
+Regrouper les éditions d'une carte qui réutilisent le **même visuel**. Aucune
+colonne existante ne le permettait :
+
+| Clé | Pourquoi elle ne convient pas |
+|---|---|
+| `oracle_id` | Regroupe aussi les rééditions entièrement redessinées — trop large |
+| `(set_code, collector_number)` | Sépare les langues d'une même version — trop étroit |
+| `artist` | Regroupe des illustrations différentes du même auteur |
+
+Scryfall publie `illustration_id`, un UUID porté par le visuel lui-même.
+
+### Ajouté
+
+- `scryfall_card_printings.illustration_id`, type **`uuid` natif** et nullable,
+  avec l'index `ix_scryfall_card_printings_illustration_id`.
+- 5 tests, dont le garde-fou d'alignement sur les trois chemins.
+
+### Deux choix à connaître
+
+**`uuid` natif plutôt que `String(36)`**, à rebours de `scryfall_id` et
+`oracle_id` qui sont des chaînes. La colonne porte un index, et 16 octets contre
+37 en divisent la taille par deux sur 548 000 lignes. Côté Python,
+`as_uuid=False` rend néanmoins une **chaîne** : les consommateurs manipulent la
+même chose que pour les deux autres identifiants.
+
+**`CREATE INDEX CONCURRENTLY`**, comme l'impose `docs/migrations.md` pour toute
+grosse table. Le cron de production passe **toutes les heures** : un
+`CREATE INDEX` ordinaire aurait verrouillé la table en écriture et bloqué un
+import. La migration vérifie `pg_index.indisvalid` avant de construire, donc
+reste rejouable si une tentative s'interrompt.
+
+### Le repli sur la face avant
+
+Sur une carte recto-verso, Scryfall ne met `illustration_id` que sur chaque
+**face**. Mesuré sur 80 000 objets du bulk du 02/11 :
+
+| | Objets |
+|---|---|
+| À la racine | 78 621 |
+| Seulement dans `card_faces[0]` | **1 249** (1,6 %) |
+| Nulle part | 130 (0,16 %) |
+
+Sans ce repli, toutes les DFC resteraient sans illustration — précisément celles
+dont on veut regrouper les rééditions. La face **avant** uniquement : les deux
+faces ont des illustrations différentes, et une convention fixe vaut mieux qu'un
+choix qui varierait d'une impression à l'autre.
+
+### ⚠️ Ordre de déploiement : migration AVANT code
+
+La migration a été appliquée en production **avant** la fusion, et c'est
+désormais la règle.
+
+Aucun job n'applique les migrations — choix délibéré, la base est partagée avec
+RELIC-Trade. Or `autoDeploy: true` est actif sur les trois crons : la fusion
+reconstruit l'image, et le passage horaire suivant tourne avec le nouveau code.
+Si la migration n'est pas déjà passée, l'import écrit sur une colonne
+inexistante et **échoue**.
+
+`ADD COLUMN` nullable étant rétrocompatible, l'ancien code ignore simplement la
+colonne : rien n'interdit de migrer d'abord. C'est l'inverse qui est dangereux.
+
+### Remplissage
+
+Un import complet suffit, aucun script de rattrapage n'est nécessaire : l'upsert
+réécrit la colonne sur les impressions existantes grâce à `IS DISTINCT FROM`.
+
+Conséquence à anticiper : le **premier** import après déploiement modifie les
+548 000 lignes au lieu des ~10 000 habituelles. Il durera sensiblement plus
+longtemps que les 18 minutes ordinaires.
+
+### Version du paquet : 0.2.0 → **0.3.0**
+
+À reprendre côté ManaMind_AI et RELIC-Trade. Une colonne au modèle ORM = une
+version mineure, règle posée en 0.2.0.
+
+---
+
 ## [0.2.0] — 2026-10-16 — Le catalogue sait en quelles finitions une carte existe
 
 Branche `feat/finitions-impressions`.

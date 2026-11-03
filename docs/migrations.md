@@ -121,6 +121,7 @@ proposait de le **supprimer**. Il est désormais déclaré (`index=True`) et con
 | `20260824_printed_name_trgm` | Extension `pg_trgm` + index GIN trigram sur `scryfall_card_printings.printed_name`, en `CREATE INDEX CONCURRENTLY`. Recherche par nom traduit : de 645 Mo lus par requête à quelques Ko. Mesures, bench d'import et exploitation : [`recherche_trigram.md`](recherche_trigram.md) |
 | `20260824_printed_name_lower` | Index fonctionnel `lower(printed_name)` pour la résolution de decklist (261 ms → 0,0 ms), et retrait du btree `ix_scryfall_card_printings_printed_name` qu'aucun consommateur ne pouvait utiliser. Bilan : −14 Mo |
 | `20260920_printing_image_status` | `image_status` : distingue un scan d'un carton « Localized Image Not Available ». Colonne nullable, aucune réécriture |
+| `20261103_illustration_id` | `illustration_id uuid` + index, en `CREATE INDEX CONCURRENTLY` : la clé de regroupement « même visuel », que ni `oracle_id` ni `(set_code, collector_number)` ne savent rendre. Le cron de production passe toutes les heures — un `CREATE INDEX` ordinaire aurait bloqué un import en écriture |
 | `20261016_printing_finishes` | `finishes TEXT[]` : les finitions réellement imprimées (`nonfoil`, `foil`, `etched`). Colonne nullable, aucune réécriture. Remplie par [`scripts/backfill_finishes.py`](../scripts/backfill_finishes.py) — 546 173 impressions en 74 s — ou par le prochain import complet |
 
 ### Ajouter une colonne au catalogue : la liste à suivre
