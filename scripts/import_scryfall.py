@@ -43,8 +43,8 @@ from sqlalchemy import text as sa_text
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mtgdb.db.engine import DATABASE_URL, SessionLocal, check_connection, engine
 from mtgdb.db.lock import AdvisoryLockHeld, verrou_si_autonome
-from mtgdb.db.engine import SessionLocal, check_connection, engine
 from mtgdb.db.publications import (
     SOURCE_SCRYFALL_BULK,
     enregistrer_publication,

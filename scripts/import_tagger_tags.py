@@ -36,8 +36,8 @@ import argparse
 import atexit
 import logging
 import sys
-from contextlib import ExitStack
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -51,8 +51,8 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mtgdb.db.lock import AdvisoryLockHeld, verrou_si_autonome
 from mtgdb.db.engine import DATABASE_URL, SessionLocal, check_connection
+from mtgdb.db.lock import AdvisoryLockHeld, verrou_si_autonome
 from mtgdb.db.models.card_tag import CardTag
 from mtgdb.db.runs import finaliser_run, marquer_runs_orphelins, ouvrir_run
 

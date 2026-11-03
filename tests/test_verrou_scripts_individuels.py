@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from mtgdb.db.lock import VARIABLE_VERROU_DETENU, advisory_lock, verrou_si_autonome
 
@@ -49,7 +50,7 @@ class TestSignalDOrchestration:
         """L'échappatoire ne doit pas s'activer toute seule : sans la variable,
         on tente la connexion — et on échoue ici, faute de base."""
         monkeypatch.delenv(VARIABLE_VERROU_DETENU, raising=False)
-        with pytest.raises(Exception):
+        with pytest.raises(SQLAlchemyError):
             with verrou_si_autonome("postgresql://inexistant:1/attrape"):
                 pytest.fail("la connexion n'aurait pas dû aboutir")
 
