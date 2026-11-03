@@ -18,7 +18,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from mtgdb.db.base import Base
@@ -116,6 +116,24 @@ class CardPrinting(Base):
     # L'ordre est celui de la source, non trié : il est stable chez Scryfall
     # (nonfoil, foil, etched), et le normaliser masquerait un changement d'API.
     finishes: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True)
+    # Identifiant de l'ILLUSTRATION, partagé par toutes les impressions qui
+    # réutilisent le même visuel — rééditions, langues, variantes de cadre.
+    # C'est la seule clé qui permette de regrouper « la même image » : ni
+    # `oracle_id` (qui regroupe aussi les réimpressions redessinées) ni
+    # `(set_code, collector_number)` (qui sépare les langues) ne le font.
+    #
+    # Type `uuid` natif plutôt que String(36) comme `scryfall_id` et
+    # `oracle_id` : la colonne porte un index, et 16 octets contre 37 divisent
+    # sa taille par deux sur 548 000 lignes. `as_uuid=False` garde néanmoins
+    # une CHAÎNE côté Python, donc le même type de valeur que les deux autres
+    # identifiants — un consommateur qui compare à une chaîne littérale n'a
+    # rien à changer.
+    #
+    # NULL signifie « inconnu » : 0,16 % des objets du bulk n'en portent pas,
+    # et la colonne reste vide jusqu'au premier import qui la remplit.
+    illustration_id: Mapped[Optional[str]] = mapped_column(
+        UUID(as_uuid=False), nullable=True, index=True
+    )
     scryfall_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cardmarket_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     tcgplayer_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)

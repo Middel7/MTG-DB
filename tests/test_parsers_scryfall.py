@@ -210,6 +210,50 @@ def test_une_liste_de_finitions_vide_n_est_pas_nulle():
     assert parse_printing_row({"id": "s", "finishes": []}, card_id=1)["finishes"] == []
 
 
+def test_l_illustration_est_reprise_de_la_racine():
+    """La cle de regroupement « meme visuel » : deux impressions qui reutilisent
+    la meme image partagent cet UUID, quelles que soient leur edition, leur
+    langue ou leur finition."""
+    ligne = parse_printing_row(
+        {"id": "s", "illustration_id": "aaaaaaaa-1111-2222-3333-444444444444"}, card_id=1)
+    assert ligne["illustration_id"] == "aaaaaaaa-1111-2222-3333-444444444444"
+
+
+def test_l_illustration_se_replie_sur_la_face_avant():
+    """Sur une carte recto-verso, Scryfall ne met `illustration_id` que sur
+    chaque FACE. Sans ce repli, 1 249 impressions sur 80 000 (1,6 %) resteraient
+    sans illustration -- toutes les DFC, precisement celles dont on veut
+    regrouper les reeditions. Cas reel : Growing Rites of Itlimoc (xln)."""
+    ligne = parse_printing_row({
+        "id": "s",
+        "card_faces": [
+            {"illustration_id": "807e1577-8345-4866-81ae-648e1610f828"},
+            {"illustration_id": "bbbbbbbb-9999-8888-7777-666666666666"},
+        ],
+    }, card_id=1)
+    assert ligne["illustration_id"] == "807e1577-8345-4866-81ae-648e1610f828"
+
+
+def test_la_racine_prime_sur_la_face():
+    """Le repli ne doit servir que lorsque la racine est muette : les deux faces
+    ont des illustrations DIFFERENTES, et preferer la face changerait la valeur
+    d'une impression qui en declare deja une."""
+    ligne = parse_printing_row({
+        "id": "s",
+        "illustration_id": "aaaaaaaa-1111-2222-3333-444444444444",
+        "card_faces": [{"illustration_id": "bbbbbbbb-9999-8888-7777-666666666666"}],
+    }, card_id=1)
+    assert ligne["illustration_id"] == "aaaaaaaa-1111-2222-3333-444444444444"
+
+
+def test_une_illustration_absente_partout_reste_nulle():
+    """0,16 % des objets du bulk n'en portent aucun, meme en repliant sur la
+    face. NULL s'y lit « illustration inconnue »."""
+    assert parse_printing_row({"id": "s"}, card_id=1)["illustration_id"] is None
+    assert parse_printing_row({"id": "s", "card_faces": [{}]},
+                              card_id=1)["illustration_id"] is None
+
+
 def test_les_booleens_absents_valent_faux_et_non_null():
     """Les colonnes correspondantes sont `NOT NULL` : un `None` ferait échouer l'INSERT."""
     ligne = parse_printing_row({"id": "s"}, card_id=1)

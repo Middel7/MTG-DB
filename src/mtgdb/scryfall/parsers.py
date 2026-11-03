@@ -153,6 +153,21 @@ def parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
         faces = raw.get("card_faces") or []
         if faces:
             img = faces[0].get("image_uris") or {}
+
+    # Même repli que pour les images, et pour la même raison : sur une carte
+    # recto-verso, Scryfall ne met `illustration_id` que sur chaque FACE. Sans
+    # ce repli, 1 249 impressions sur 80 000 (1,6 %) resteraient sans
+    # illustration — toutes les DFC, qui sont précisément celles dont on veut
+    # regrouper les rééditions.
+    #
+    # On prend la face avant uniquement : les deux faces ont des illustrations
+    # DIFFÉRENTES, et en retenir une seule par convention vaut mieux qu'un choix
+    # qui varierait d'une impression à l'autre.
+    illustration_id = raw.get("illustration_id")
+    if not illustration_id:
+        faces = raw.get("card_faces") or []
+        if faces:
+            illustration_id = faces[0].get("illustration_id")
     released_at = None
     if raw_date := raw.get("released_at"):
         try:
@@ -185,6 +200,10 @@ def parse_printing_row(raw: dict[str, Any], card_id: int) -> dict[str, Any]:
         # ["etched"]... Les booleens `foil` / `nonfoil` de l'API sont deprecies et
         # ne savent pas exprimer « etched » : on ne les lit pas.
         "finishes": raw.get("finishes"),
+        # Partagé par toutes les impressions qui réutilisent le même visuel :
+        # c'est la clé de regroupement « même illustration », que ni oracle_id
+        # ni (set_code, collector_number) ne savent rendre.
+        "illustration_id": illustration_id,
         "scryfall_uri": raw.get("scryfall_uri"),
         "cardmarket_id": raw.get("cardmarket_id"),
         "tcgplayer_id": raw.get("tcgplayer_id"),
