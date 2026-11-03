@@ -16,7 +16,7 @@ planifiée Windows ne vise plus la production.
 | Cible | Qui déclenche | Quand | Commande |
 |---|---|---|---|
 | **Production** (Render `relictrade`) | Cron Job Render `mtgdb-catalogue-quotidien` | **toutes les heures** | `python scripts/update_all.py --skip tags` |
-| **Production** | Cron Job Render `mtgdb-tags-hebdomadaire` | 05:00 UTC, le dimanche | `python scripts/update_all.py --only tags` |
+| **Production** | Cron Job Render `mtgdb-tags-hebdomadaire` | **05:30** UTC, le dimanche | `python scripts/update_all.py --only tags --attendre-verrou 900` |
 | **Production** | Cron Job Render `mtgdb-veille-fraicheur` | 08:00 UTC, tous les jours | `python scripts/fraicheur.py --check` |
 | **Locale** (`manamind`) | Planificateur Windows `MTG-DB Update` | 08:00 et 20:00 | `update.ps1 --skip tags` |
 | **Locale** | Planificateur Windows `MTG-DB Tags` | dimanche 05:00 | `update.ps1 --only tags` |
@@ -130,6 +130,13 @@ C'est la signature du plus petit plan payant (**Basic-256mb : 256 Mo de RAM,
 > **Le passage au cloud supprime la dépendance au poste, pas la lenteur.**
 > Le seul levier sur la durée est le plan de la base — décision qui engage aussi
 > RELIC-Trade, qui partage cette instance.
+
+> **Pourquoi 05:30 et non 05:00.** Le job de catalogue passe toutes les heures,
+> donc à 05:00 pile lui aussi. Les deux démarraient à la même seconde, et celui
+> qui perdait la course au verrou sortait en code 2 — que Render rapporte comme
+> un échec. Les tags n'ont plus été rafraîchis du 04/10 au 03/11/2026. Un run
+> horaire qui renonce retrouve sa place dans l'heure ; un run hebdomadaire perd
+> sa semaine. D'où la minute 30 **et** `--attendre-verrou`.
 
 ---
 

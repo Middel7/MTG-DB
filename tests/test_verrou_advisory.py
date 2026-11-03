@@ -155,3 +155,66 @@ def test_la_connexion_du_verrou_ne_reste_pas_en_transaction(database_url, verrou
         )
     finally:
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_un_run_patient_obtient_le_verrou_libere(database_url, verrou_libre):
+    """
+    `--attendre-verrou` existe pour les runs RARES.
+
+    Le job de tags est hebdomadaire et démarrait à 05:00 UTC, en même temps que
+    le job de catalogue qui passe toutes les heures. Celui qui perdait la course
+    sortait en code 2 — et perdait sa semaine. Les tags n'ont plus été
+    rafraîchis du 04/10 au 03/11.
+    """
+    import threading
+    import time
+
+    libere = threading.Event()
+
+    def detenteur():
+        with advisory_lock(database_url, heartbeat_seconds=0):
+            time.sleep(1.5)
+        libere.set()
+
+    fil = threading.Thread(target=detenteur, daemon=True)
+    fil.start()
+    time.sleep(0.4)  # laisse le détenteur prendre le verrou
+
+    debut = time.monotonic()
+    with advisory_lock(database_url, heartbeat_seconds=0, attente_max_s=30):
+        attente = time.monotonic() - debut
+    fil.join(timeout=10)
+
+    assert libere.is_set(), "le détenteur n'a pas relâché le verrou"
+    assert attente >= 0.5, "le second run n'a pas attendu : il a dû prendre un verrou libre"
+
+
+@pytest.mark.integration
+def test_un_run_patient_renonce_au_bout_du_temps_imparti(database_url, verrou_libre):
+    """L'attente est bornée : un verrou tenu indéfiniment ne doit pas figer le run."""
+    import time
+
+    with advisory_lock(database_url, heartbeat_seconds=0):
+        debut = time.monotonic()
+        with pytest.raises(AdvisoryLockHeld) as exc:
+            with advisory_lock(database_url, heartbeat_seconds=0, attente_max_s=2):
+                pytest.fail("le verrou n'aurait pas dû être accordé")
+        ecoule = time.monotonic() - debut
+
+    assert 2 <= ecoule < 20, f"attente de {ecoule:.1f} s, hors du budget demandé"
+    assert "attente" in str(exc.value), "le message doit dire que l'on a patienté"
+
+
+@pytest.mark.integration
+def test_sans_attente_le_comportement_reste_immediat(database_url, verrou_libre):
+    """Le défaut ne change pas : un run horaire qui renonce retrouve sa place
+    dans l'heure, et attendre lui ferait refaire le même travail juste après."""
+    import time
+
+    with advisory_lock(database_url, heartbeat_seconds=0):
+        debut = time.monotonic()
+        with pytest.raises(AdvisoryLockHeld):
+            with advisory_lock(database_url, heartbeat_seconds=0):
+                pytest.fail("le verrou n'aurait pas dû être accordé")
+        assert time.monotonic() - debut < 1.0, "l'abandon doit rester immédiat"

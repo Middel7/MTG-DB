@@ -5,6 +5,65 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [0.3.1] — 2026-11-03 — Les tags ne perdent plus leur semaine sur une course au verrou
+
+Branche `fix/collision-verrou-tags`.
+
+### Le défaut
+
+```
+mtgdb-catalogue-quotidien   schedule: "0 * * * *"    ← toutes les heures, minute 0
+mtgdb-tags-hebdomadaire     schedule: "0 5 * * 0"    ← dimanche 05:00, minute 0
+```
+
+Les deux jobs démarraient **à la même seconde**. Le premier prenait le verrou
+`pg_advisory_lock`, le second sortait en code 2 — que Render rapporte comme un
+« Failed run ».
+
+**Les tags n'ont plus été rafraîchis du 04/10 au 03/11.** Les runs du 27/09, du
+11/10 et du 18/10 n'ont laissé aucune trace en base, pas même une ligne
+`running` : le script sortait avant d'ouvrir son run. Le 04/10 avait gagné la
+course, les autres l'ont perdue — d'où l'intermittence.
+
+Régression introduite le 20/09 en passant le catalogue de quotidien à horaire :
+auparavant il ne tournait qu'à 01:00 et ne croisait jamais les tags.
+
+### Le correctif, en deux protections
+
+| | |
+|---|---|
+| `schedule: "30 5 * * 0"` | Écarte le croisement nominal — un passage de catalogue à vide dure ~40 s, un import complet ~18 min |
+| `--attendre-verrou 900` | Couvre le cas où un import déborderait malgré tout |
+
+### Pourquoi une option plutôt qu'un changement de comportement
+
+`pg_try_advisory_lock` qui renonce immédiatement est le **bon** comportement
+pour un run horaire : le travail sera fait au passage suivant, et attendre lui
+ferait refaire le même travail juste après. C'est le **mauvais** pour un run
+hebdomadaire, qui perd sa semaine.
+
+`--attendre-verrou` nuance cela sans toucher au défaut, et sa documentation dit
+de le réserver aux runs rares.
+
+Sondage toutes les 10 s plutôt qu'un `pg_advisory_lock` bloquant : une attente
+côté serveur immobiliserait une connexion sans qu'on puisse la borner ni la
+journaliser, et un run qui semble figé sans rien dire est le pire des cas pour
+qui lit les logs à distance.
+
+### Réserve
+
+Le diagnostic repose sur un faisceau — horaires identiques à la seconde, absence
+totale de ligne `import_runs`, intermittence selon qui gagne la course — et non
+sur les logs Render, auxquels je n'ai pas accès. Le correctif est sans risque
+même si la cause est ailleurs ; si les tags échouent encore, il faudra ces logs.
+
+### Tests
+
+3 nouveaux : le run patient qui obtient un verrou libéré, celui qui renonce au
+bout du temps imparti, et le défaut inchangé qui abandonne immédiatement.
+
+---
+
 ## [0.3.0] — 2026-11-03 — Regrouper les éditions qui partagent la même illustration
 
 Branche `feat/illustration-id`. Demandé par ManaMind.
