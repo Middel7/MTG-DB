@@ -24,6 +24,7 @@ Codes de sortie :
   0  toutes les étapes demandées ont réussi
   1  au moins une étape a échoué
   2  un autre run est déjà en cours (verrou détenu)
+  3  migration manquante : la base est en retard sur ce code
 
 Usage :
   python scripts/update_all.py                 # mise à jour complète
@@ -70,9 +71,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from mtgdb.db.engine import (  # noqa: E402 — après sys.path, comme les autres scripts
     DATABASE_URL,
     LocalDatabaseRefused,
+    SessionLocal,
     assert_remote_database,
 )
 from mtgdb.db.lock import AdvisoryLockHeld, advisory_lock  # noqa: E402
+from mtgdb.db.schema_version import CODE_EN_AVANCE, verifier_schema  # noqa: E402
 from mtgdb.db.urls import redact_database_url  # noqa: E402
 from mtgdb.runtime import in_container  # noqa: E402
 
@@ -504,6 +507,19 @@ def main() -> None:
             out.line(f"\n  ✗ {exc}", "red")
             out.close()
             sys.exit(1)
+
+    # Le schéma porte-t-il ce que ce code va écrire ? `autoDeploy` met le
+    # nouveau code en service dès la fusion, alors qu'aucun job n'applique les
+    # migrations : sans ce contrôle, un run peut écrire sur une colonne qui
+    # n'existe pas encore et échouer au milieu de 540 000 upserts, sur un
+    # message qui ne désigne pas la cause.
+    if not cli.dry_run:
+        etat_schema, message_schema = verifier_schema(SessionLocal)
+        if etat_schema == CODE_EN_AVANCE:
+            out.line(f"\n✗ {message_schema}", "red")
+            out.close()
+            sys.exit(3)
+        out.line(f"  Schéma  : {message_schema}", "grey")
 
     results: list[dict] = []
     global_start = time.monotonic()
