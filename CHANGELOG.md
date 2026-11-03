@@ -5,6 +5,69 @@ Les dates sont au format AAAA-MM-JJ.
 
 ---
 
+## [0.3.2] — 2026-11-03 — Un run refuse de démarrer si sa migration manque
+
+Branche `feat/garde-fou-schema`.
+
+### Le défaut
+
+Aucun job n'applique les migrations — choix délibéré, la base de production est
+partagée avec RELIC-Trade. Mais `autoDeploy: true` est actif sur les trois crons :
+
+1. la PR est fusionnée, Render reconstruit l'image en quelques minutes ;
+2. le passage horaire suivant tourne avec le **nouveau code** ;
+3. si la migration n'a pas été appliquée entre-temps, l'import écrit sur une
+   colonne inexistante et échoue — au milieu de 540 000 upserts, sur un
+   `UndefinedColumn` qui ne désigne pas la cause.
+
+La fenêtre est d'une heure au mieux, de quelques secondes au pire. Elle a été
+franchie deux fois à la main, avec quinze minutes de marge le 16/10 — par
+chance, pas par conception.
+
+### Ce que ça change
+
+Le run **refuse de commencer** et sort en **code 3** :
+
+```
+✗ MIGRATION MANQUANTE. Ce code attend la révision 20261103_illustration_id,
+  la base est restée en 20261016_printing_finishes. À appliquer :
+  20261103_illustration_id. Lancer « alembic upgrade head » sur cette base
+  AVANT de rejouer ce run.
+```
+
+Deux secondes au lieu de vingt minutes, et un message qui nomme la commande.
+
+### Quatre verdicts, pas deux
+
+| État | Verdict |
+|---|---|
+| Révisions identiques | Rien à signaler |
+| **Base en retard** | **Blocage, code 3** — le code écrira ce que la base n'a pas |
+| Base en avance | Avertissement seulement : une image ancienne contre une base migrée est sans danger, `ADD COLUMN` étant rétrocompatible. Bloquer empêcherait un retour arrière volontaire |
+| Indéterminé | On ne bloque pas sur une inconnue : un contrôle qui planterait faute de lire `alembic.ini` ajouterait une panne là où il doit en éviter une |
+
+### Choix de conception
+
+**Comparer les révisions Alembic, pas la liste des colonnes.** Si la révision
+concorde, le schéma concorde — et le contrôle couvre d'avance les migrations qui
+ne touchent à aucune colonne : index, vues, contraintes.
+
+**Lire la tête depuis `alembic/`** plutôt que la figer dans une constante : une
+constante se désynchronise au premier oubli, et c'est l'oubli qu'on traque.
+
+### Vérifié en conditions réelles
+
+La révision locale a été reculée à la main, puis remise : le run a bien refusé
+de démarrer avec le code 3 et le message ci-dessus, puis est reparti normalement.
+
+### Tests
+
+10 nouveaux, **274 au total**. Le cœur est une fonction pure — ces tests ne
+touchent ni la base ni le disque — plus un test d'intégration qui échouerait si
+quelqu'un ajoutait une migration sans l'appliquer en local.
+
+---
+
 ## [0.3.1] — 2026-11-03 — Les tags ne perdent plus leur semaine sur une course au verrou
 
 Branche `fix/collision-verrou-tags`.
